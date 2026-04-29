@@ -1,0 +1,9 @@
+Specialty Type,Antibiotic,Cardiovascular,Diabetes,Painkiller,Respiratory
+General,1,1,1,1,1
+Cardiac,0.6,1.8,0.5,1.5,0.8
+Endocrinology,0.8,0.7,2,0.8,0.7
+Infectious Disease,2,0.7,0.8,0.8,0.8
+Tropical Disease,1.8,0.7,0.7,1.2,1
+Pediatric,1.5,0.6,0.5,1.3,1.4
+Orthopedic,0.7,0.6,0.8,1.8,0.7
+Oncology,0.8,0.7,0.7,1.5,0.8

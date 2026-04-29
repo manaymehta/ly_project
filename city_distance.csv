@@ -1,0 +1,13 @@
+From \ To,Delhi,Gurgaon,Mumbai,Pune,Bangalore,Hyderabad,Chennai,Kolkata,Ahmedabad,Puducherry,Nagpur,Rajkot
+Delhi,0,0,1,1,2,1,2,1,1,2,1,2
+Gurgaon,0,0,1,1,2,1,2,1,1,2,1,2
+Mumbai,1,1,0,0,1,1,1,2,1,2,1,1
+Pune,1,1,0,0,1,1,1,2,1,2,1,1
+Bangalore,2,2,1,1,0,1,1,2,2,1,1,2
+Hyderabad,1,1,1,1,1,0,1,1,2,1,1,2
+Chennai,2,2,1,1,1,1,0,1,2,0,1,2
+Kolkata,1,1,2,2,2,1,1,0,2,1,1,2
+Ahmedabad,1,1,1,1,2,2,2,2,0,2,1,0
+Puducherry,2,2,2,2,1,1,0,1,2,0,2,2
+Nagpur,1,1,1,1,1,1,1,1,1,2,0,1
+Rajkot,2,2,1,1,2,2,2,2,0,2,1,0

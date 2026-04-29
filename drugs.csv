@@ -1,0 +1,21 @@
+Drug ID,Brand Name,Generic Name,API Used,Typical Batch Size,Seasonality Profile,Consumption Type,Category,Criticality,Base Price (?/unit),Base Rate
+D001,Lantus,Insulin Glargine,A001,500,"Flat (chronic, year-round)","Chronic, small subset",Diabetes,Life-Critical,180,15
+D002,Glycomet,Metformin 500mg,A002,"5,000","Flat (chronic, year-round)","Chronic, large subset",Diabetes,High,8,120
+D003,Amaryl,Glimepiride 2mg,A003,"3,000","Flat (chronic, year-round)","Chronic, medium subset",Diabetes,Moderate,12,55
+D004,Amoxil,Amoxicillin 500mg,A004,"5,000",Monsoon + Winter spike,"Acute, very wide use",Antibiotic,Moderate,15,95
+D005,Augmentin,Amoxicillin-Clavulanate,A004,"3,000",Monsoon + Winter spike,"Acute, selective use",Antibiotic,High,28,40
+D006,Azithral,Azithromycin 500mg,A005,"3,000",Monsoon + Winter spike,"Acute, wide use",Antibiotic,High,22,60
+D007,Ciplox,Ciprofloxacin 500mg,A006,"4,000",Monsoon spike,"Acute, selective use",Antibiotic,High,18,45
+D008,Calpol,Paracetamol 500mg,A007,"10,000",Monsoon + Winter spike,"Acute, near-universal use",Painkiller,Moderate,5,280
+D009,Combiflam,"Ibuprofen, Paracetamol",A008,"6,000",Monsoon + Winter spike,"Acute, moderate use",Painkiller,Moderate,10,85
+D010,Brufen,Ibuprofen 400mg,A008,"6,000",Winter spike,"Acute, moderate use",Painkiller,Low,8,70
+D011,Amlip,Amlodipine 5mg,A009,"4,000","Flat (chronic, year-round)","Chronic, wide use",Cardiovascular,Life-Critical,12,75
+D012,Amlosafe,Amlodipine 10mg,A009,"3,000","Flat (chronic, year-round)","Chronic, smaller subset",Cardiovascular,High,18,35
+D013,Atorva,Atorvastatin 10mg,A010,"4,000","Flat (chronic, year-round)","Chronic, wide use",Cardiovascular,Moderate,14,80
+D014,Storvas,Atorvastatin 20mg,A010,"3,000","Flat (chronic, year-round)","Chronic, smaller subset",Cardiovascular,Low,20,40
+D015,Metolar,Metoprolol 25mg,A011,"4,000","Flat (chronic, year-round)","Chronic, moderate use",Cardiovascular,Life-Critical,10,65
+D016,Metolar XR,Metoprolol 50mg,A011,"3,000","Flat (chronic, year-round)","Chronic, smaller subset",Cardiovascular,High,16,30
+D017,Asthalin,Salbutamol Inhaler,A012,"1,000",Winter + Monsoon spike,"Chronic/Acute, moderate use",Respiratory,Life-Critical,85,25
+D018,Ventorlin,Salbutamol Syrup,A012,"2,000",Winter + Monsoon spike,"Chronic/Acute, pediatric focus",Respiratory,High,45,20
+D019,Cephalex,Cephalexin 500mg,A004,"4,000",Monsoon + Winter spike,"Acute, alternative antibiotic",Antibiotic,High,18,50
+D020,Levoflox,Levofloxacin 500mg,A006,"3,000",Monsoon spike,"Acute, selective use",Antibiotic,Moderate,24,35

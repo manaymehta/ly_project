@@ -1,0 +1,6 @@
+Factory ID,Name,City,Specialization,Monthly Capacity (units),Reliability Score
+F001,Biocon Biologics,Bangalore,Biologics & Insulin,"1,80,000",0.92
+F002,Cipla Ltd,Mumbai,Antibiotics & Respiratory,"2,50,000",0.88
+F003,Sun Pharma,Vadodara,Painkillers & CNS,"2,20,000",0.85
+F004,Dr. Reddy's Laboratories,Hyderabad,Diabetes & Cardiovascular,"2,00,000",0.9
+F005,Lupin Pharmaceuticals,Pune,Cardiovascular & Antibiotics,"2,10,000",0.87

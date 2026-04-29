@@ -1,0 +1,13 @@
+API ID,Name,Category,Complexity Factor
+A001,Insulin Glargine API,Biologics,0.9
+A002,Metformin API,Diabetes,0.3
+A003,Glimepiride API,Diabetes,0.4
+A004,Amoxicillin API,Antibiotic,0.3
+A005,Azithromycin API,Antibiotic,0.4
+A006,Ciprofloxacin API,Antibiotic,0.4
+A007,Paracetamol API,Painkiller,0.2
+A008,Ibuprofen API,Painkiller,0.2
+A009,Amlodipine API,Cardiovascular,0.4
+A010,Atorvastatin API,Cardiovascular,0.5
+A011,Metoprolol API,Cardiovascular,0.4
+A012,Salbutamol API,Respiratory,0.5

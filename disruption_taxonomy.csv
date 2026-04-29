@@ -1,0 +1,21 @@
+Node Type,Event Type,Severity,Min Days,Max Days
+Factory,Disaster,High,45,60
+Factory,Disaster,Medium,25,38
+Factory,Equipment Failure,High,28,40
+Factory,Equipment Failure,Medium,14,22
+Factory,Equipment Failure,Low,3,7
+Factory,Strike,High,38,52
+Factory,Strike,Medium,18,28
+Factory,License Hold,High,55,90
+Factory,License Hold,Medium,28,42
+Factory,Raw Material Shortage,High,40,58
+Factory,Raw Material Shortage,Medium,18,30
+API,Raw Material Shortage,High,40,55
+API,Supply Chain Failure,High,45,65
+Distributor,Logistics Failure,High,12,18
+Distributor,Logistics Failure,Medium,4,8
+Distributor,Strike,Medium,10,16
+Distributor,License Suspension,High,30,50
+Distributor,Storage Failure,High,20,32
+Distributor,Storage Failure,Medium,8,14
+Distributor,Disaster,High,25,40

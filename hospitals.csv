@@ -1,0 +1,11 @@
+Hospital ID,Name,City,Specialty Focus,Specialty Type,Avg Daily Patients
+H001,AIIMS Delhi,Delhi,"General, All Specialties",General,"2,500"
+H002,Apollo Hospitals,Chennai,"Cardiac, Oncology",Cardiac,"1,800"
+H003,Fortis Memorial,Gurgaon,"General, Neurology",General,"1,600"
+H004,KEM Hospital,Mumbai,"General, Infectious Disease",Infectious Disease,"2,000"
+H005,Narayana Health,Bangalore,"Cardiac, Pediatric",Cardiac,"1,200"
+H006,Nizam's Institute,Hyderabad,"General, Endocrinology",Endocrinology,"1,100"
+H007,Jehangir Hospital,Pune,"General, Orthopedic",Orthopedic,900
+H008,JIPMER,Puducherry,"General, Tropical Disease",Tropical Disease,"1,000"
+H009,District Hospital Nagpur,Nagpur,General,General,500
+H010,Civil Hospital Rajkot,Rajkot,General,General,400

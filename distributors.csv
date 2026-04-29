@@ -1,0 +1,11 @@
+Distributor ID,Name,City,Type,Reliability Score,Pricing Tier,Volume Tendency,Delivery Speed Class,Specialization
+S001,Medplus Wholesale,Hyderabad,National Distributor,0.93,Standard,High,Standard,General
+S002,Keimed Pvt Ltd,Chennai,Regional Distributor,0.88,Standard,Medium,Standard,General
+S003,Lifeline Drug House,Mumbai,Regional Distributor,0.85,Standard,Medium,Standard,General
+S004,Savior Drugs,Delhi,Regional Distributor,0.87,Standard,Medium,Standard,General
+S005,PharmReach,Kolkata,Regional Distributor,0.83,Budget,Medium,Slow,General
+S006,NovaMed Distributors,Hyderabad,National Distributor,0.89,Standard,High,Standard,General
+S007,BioSupply India,Pune,Specialty Biologics,0.91,Premium,High,Standard,Biologics Only
+S008,CriticalMed Supplies,Delhi,Critical Drugs Specialist,0.94,Premium,Low,Express,Critical Only
+S009,SwiftPharma,Mumbai,Express Delivery Specialist,0.92,Premium,Low,Express,General
+S010,GenericFirst,Ahmedabad,Generic Drug Specialist,0.8,Budget,High,Slow,Generics Only
