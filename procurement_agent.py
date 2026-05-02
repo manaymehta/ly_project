@@ -46,9 +46,13 @@ from analyst import DrugAlertPackage, HospitalRisk
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = "AIzaSyBsWNU1nC6Ntn0H4CaYtAaudchc39E1etA"
 GEMINI_MODEL   = "gemma-4-26b-a4b-it"   # ← change model name here if needed
+
+# Set False to force all drugs through the LLM (useful for testing parallel calls).
+# Set True (default) to skip the LLM for trivially small gaps (gap < all MOQs).
+MICRO_GAP_FAST_PATH = False
 # ──────────────────────────────────────────────────────────────────────────────
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+
 
 SYSTEM_INSTRUCTION = (
     "You are a pharmaceutical supply chain procurement specialist. "
@@ -94,11 +98,12 @@ def _drug_block(pkg: DrugAlertPackage) -> str:
 def _hospitals_with_distributors_block(
     pkg:          DrugAlertPackage,
     hospital_ids: Optional[list] = None,
+    bridge_map:   Optional[dict] = None,   # {hospital_id: bridge_units_needed}
 ) -> str:
     """
     Per-hospital section interleaved with that hospital's distributor options.
-    Each hospital shows urgency data then its distributors sorted by delivery speed.
-    Delivery feasibility pre-computed per hospital per distributor.
+    Lean format — names kept for ID disambiguation, noise (price/reliability/city)
+    stripped to reduce token bloat and focus LLM attention on allocation math.
     BELOW MIN ORDER shown as advisory — not a hard disqualification.
     """
     if hospital_ids is None:
@@ -106,84 +111,68 @@ def _hospitals_with_distributors_block(
     else:
         target_hids = hospital_ids
 
-    # Build distributor meta lookup — stock/price/min-order same across hospitals
+    # Build distributor meta lookup — only what the LLM needs
     dist_meta = {}
     for h in pkg.hospitals:
         for d in h.distributors:
             did = d["distributor_id"]
             if did not in dist_meta:
                 dist_meta[did] = {
-                    "name":                d["name"],
-                    "city":                d["city"],
-                    "delivery_speed_class":d["delivery_speed_class"],
-                    "reliability_score":   d["reliability_score"],
-                    "pricing_tier":        d["pricing_tier"],
-                    "current_stock":       d["current_stock"],
-                    "min_order":           d["min_order"],
-                    "price_per_unit":      d["price_per_unit"],
+                    "name":          d["name"],
+                    "current_stock": d["current_stock"],
+                    "min_order":     d["min_order"],
                 }
 
+    # Global stock pool — gives LLM a reference starting point for scratchpad tracking
+    pool_parts = []
+    seen_dids  = set()
+    for h in pkg.hospitals:
+        if h.hospital_id not in target_hids:
+            continue
+        for d in h.distributors:
+            did = d["distributor_id"]
+            if did not in seen_dids:
+                meta = dist_meta[did]
+                pool_parts.append(f"{did}={meta['current_stock']:,}")
+                seen_dids.add(did)
+
     lines = [
-        "HOSPITALS AND THEIR DISTRIBUTOR OPTIONS",
-        "(Each hospital lists distributors sorted by delivery speed.)",
+        "HOSPITALS AND DISTRIBUTOR OPTIONS",
         "(BELOW MIN ORDER = negotiation may be required — do not auto-disqualify.)",
-        "(current_stock = distributor total stock for this drug, not per-hospital.)",
+        f"GLOBAL STOCK POOL: {' | '.join(pool_parts)}",
     ]
 
     for h in pkg.hospitals:
         if h.hospital_id not in target_hids:
             continue
 
-        exposed = max(0.0, pkg.recovery_days - h.days_until_stockout)
+        bridge_need = (bridge_map or {}).get(h.hospital_id, 0)
         lines.append(
-            f"\n── {h.hospital_id} {h.hospital_name} ({h.hospital_city}) ──\n"
-            f"   Specialty: {h.specialty_type}\n"
-            f"   Risk: {h.risk_level} | Stockout in: {h.days_until_stockout:.1f} days\n"
-            f"   Exposed for: {exposed:.1f} days | "
-            f"Units needed (30d): {h.prophet_forecast_30d:,.0f}"
+            f"\n── {h.hospital_id} {h.hospital_name}"
+            f" | Stockout: {h.days_until_stockout:.1f}d"
+            f" | Bridge: {bridge_need:,} units ──"
         )
 
         if not h.distributors:
             lines.append("   No distributors available.")
             continue
 
-        # Sort distributors by delivery days ascending for this hospital
         sorted_dists = sorted(h.distributors, key=lambda d: d["delivery_days"])
-        lines.append("   Distributor options (fastest first):")
-
         for d in sorted_dists:
             did      = d["distributor_id"]
-            meta     = dist_meta.get(did, d)
+            meta     = dist_meta.get(did, {})
             delivery = d["delivery_days"]
             stockout = h.days_until_stockout
 
-            # Delivery feasibility
-            if delivery < stockout:
-                feasibility = (
-                    f"ARRIVES IN TIME ({delivery}d < stockout {stockout:.1f}d)"
-                )
-            else:
-                feasibility = (
-                    f"ARRIVES AFTER STOCKOUT ({delivery}d > stockout {stockout:.1f}d)"
-                )
-
-            # Min-order advisory
-            if meta["current_stock"] >= meta["min_order"]:
-                order_note = f"meets min-order ({meta['min_order']:,} units)"
-            else:
-                order_note = (
-                    f"BELOW MIN ORDER — stock {meta['current_stock']:,} "
-                    f"< min {meta['min_order']:,} — negotiation may be required"
-                )
+            timing   = "IN TIME      " if delivery < stockout else "AFTER STOCKOUT"
+            min_ord  = meta.get("min_order", 0)
+            stock    = meta.get("current_stock", 0)
+            min_flag = "(BELOW MIN)" if stock < min_ord else "(MEETS MIN)"
 
             lines.append(
-                f"     {did} {meta['name']} ({meta['city']})"
-                f" | Speed: {meta['delivery_speed_class']}"
-                f" | Reliability: {meta['reliability_score']}\n"
-                f"       Stock: {meta['current_stock']:,} units"
-                f" | Price: Rs {meta['price_per_unit']}/unit"
-                f" | {order_note}\n"
-                f"       {feasibility}"
+                f"  [{timing}] {did} {meta.get('name', did)}"
+                f" | Stock: {stock:,}"
+                f" | Min Order: {min_ord:,} {min_flag}"
             )
 
     return "\n".join(lines)
@@ -381,18 +370,21 @@ def _build_task(gap_hospitals: list) -> str:
         f"Total bridge units needed: {total_needed:,} across {len(gap_hospitals)} hospitals.\n\n"
         f"Process hospitals in this urgency order (most urgent first): {', '.join(sorted_hids)}\n\n"
         f"STRATEGY DEFINITIONS (CRITICAL):\n"
+        f"  - NO SHORTAGE (Abundant Supply): If Total Global Supply >= Total Demand, Option A and Option B will be IDENTICAL.\n"
+        f"    Give every hospital 100% of their need. Do not reduce allocations. is_dicey_case is false.\n"
         f"  - OPTION A (Universal Coverage): If demand exceeds supply, do NOT let the bottom hospitals starve. "
         f"    Manually reduce the units assigned to top-priority hospitals to leave a 'Survival Reserve' in the global pool. "
         f"    Every hospital MUST receive at least a partial allocation.\n"
         f"  - OPTION B (Ruthless Triage): Process strictly top-down. Give top-priority hospitals 100% of their need "
         f"    until the global pool hits 0. Let the bottom hospitals starve if necessary.\n\n"
-        f"STOCK RULE: Each distributor has ONE total stock pool. If you assign distributor X\n"
-        f"to hospital A, that uses up stock from that distributor X. Assign the same distributor to a second\n"
-        f"hospital only if its current_stock can cover both hospitals' bridge_units_needed combined.\n\n"
+        f"STOCK RULE: Each distributor has ONE global stock pool. When you assign units to a hospital, "
+        f"subtract them from the global pool. You can assign a distributor's remaining stock to a second hospital "
+        f"even if it only partially covers the second hospital's need.\n\n"
         f"For each hospital (process strictly in the order above):\n"
         f"  1. Start with ARRIVES IN TIME distributors. If one has enough stock to fully cover the need, assign it.\n"
-        f"  2. MULTI-FILL: If an ARRIVES IN TIME distributor's stock is too small (e.g. S009 with 146 units for a hospital needing thousands),\n"
-        f"     assign it to bridge the immediate gap, AND ALSO assign an ARRIVES AFTER STOCKOUT distributor to cover the rest of the volume.\n"
+        f"  2. MULTI-FILL: If an ARRIVES IN TIME distributor's stock is too small (e.g. S009 with 146 units "
+        f"     for a hospital needing thousands), assign it to bridge the immediate gap, AND ALSO assign an "
+        f"     ARRIVES AFTER STOCKOUT distributor to cover the rest of the volume.\n"
         f"  3. If no in-time options exist, assign the ARRIVES AFTER STOCKOUT distributor with the most stock.\n"
         f"  4. Flag BELOW MIN ORDER situations in caveats — do not disqualify for this alone.\n\n"
         f"MATH RULES FOR MULTI-FILL:\n"
@@ -406,9 +398,9 @@ def _build_task(gap_hospitals: list) -> str:
         f'  "option_a_scratchpad": {{"<HOSPITAL ID>": "<If shortage, state reduced target to save reserve. Explain Exact Change, Min Order check, and updated global stock here>"}},\n'
         f'  "bridge_order_summary": "<2-3 sentences>",\n'
         f'  "is_dicey_case": true or false,\n'
-        f'  "dicey_tradeoff": "<description of the tradeoff between Universal Coverage and Ruthless Triage>",\n'
+        f'  "dicey_tradeoff": "<description of the tradeoff, or \"N/A - Sufficient supply\" if is_dicey_case is false>",\n'
         f'  "option_a_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
-        f'  "option_a_strategy": "Universal Coverage: Manually reduced top allocations to guarantee survival stock for all hospitals.",\n'
+        f'  "option_a_strategy": "<1 sentence naming the strategy used (e.g. \"Abundant Supply Fulfillment\" or \"Universal Coverage\")>",\n'
         f'  "option_b_scratchpad": {{"<HOSPITAL ID>": "<RESET ALL STOCK POOLS TO ORIGINAL VALUES. Apply Ruthless Triage: Feed top hospitals 100% until stock is 0. Explain math here>"}},\n'
         f'  "option_b_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
         f'  "option_b_strategy": "Ruthless Triage: Guaranteed 100% coverage for highest urgency, sacrificing lowest urgency.",\n'
@@ -420,8 +412,9 @@ def _build_task(gap_hospitals: list) -> str:
 
 def _build_bridge_prompt(pkg: DrugAlertPackage, gap_hospitals: list) -> str:
     """Assembles the full bridge-order LLM prompt from context blocks + task."""
-    gap_hids  = [h["hospital_id"] for h in gap_hospitals]
-    gap_lines = [
+    gap_hids   = [h["hospital_id"] for h in gap_hospitals]
+    bridge_map = {h["hospital_id"]: h["bridge_units_needed"] for h in gap_hospitals}
+    gap_lines  = [
         f"  {h['hospital_id']} ({h.get('hospital_name', '')}) | "
         f"Stockout in {h['days_until_stockout']}d | Bridge needed: {h['bridge_units_needed']:,} units"
         for h in gap_hospitals
@@ -431,7 +424,7 @@ def _build_bridge_prompt(pkg: DrugAlertPackage, gap_hospitals: list) -> str:
         _disruption_block(pkg),
         _drug_block(pkg),
         gap_section,
-        _hospitals_with_distributors_block(pkg, hospital_ids=gap_hids),
+        _hospitals_with_distributors_block(pkg, hospital_ids=gap_hids, bridge_map=bridge_map),
         _build_task(gap_hospitals),
     ])
 
@@ -441,16 +434,39 @@ def _build_bridge_prompt(pkg: DrugAlertPackage, gap_hospitals: list) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _call_gemini(prompt: str, max_tokens: int = 2048) -> str:
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=max_tokens,
-            system_instruction=SYSTEM_INSTRUCTION,
-        ),
-    )
-    return response.text or ""
+    import sys, pathlib, threading
+    from datetime import datetime
+
+    # Fresh client per call — thread isolation (no shared httpx session across threads)
+    _client = genai.Client(api_key=GEMINI_API_KEY)
+
+    thread_name = threading.current_thread().name
+    try:
+        response = _client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=max_tokens,
+                system_instruction=SYSTEM_INSTRUCTION,
+            ),
+        )
+        return response.text or ""
+
+    except Exception as e:
+        ts  = datetime.now().strftime("%H:%M:%S")
+        msg = (
+            f"[{ts}] [{thread_name}] _call_gemini ERROR\n"
+            f"  Type   : {type(e).__name__}\n"
+            f"  Message: {e}\n"
+        )
+        print(msg, file=sys.stderr, flush=True)
+        log_path = pathlib.Path("raw_output/api_errors.log")
+        log_path.parent.mkdir(exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as _lf:
+            _lf.write(msg + "\n")
+        raise
+
 
 
 def _strip_scratchpads(text: str) -> str:
@@ -707,8 +723,7 @@ def run_procurement_agent(
         else:
             covered_hids.append(h.hospital_id)
 
-    # Build allocation dict with same field names the old LLM Call 1 returned —
-    # all downstream code (result["allocation"], bridge prompt, verbose) unchanged.
+    # Build allocation dict
     gap_summary = ", ".join(
         f"{h['hospital_id']} ({h['days_until_stockout']}d)" for h in gap_hospitals
     )
@@ -733,13 +748,13 @@ def run_procurement_agent(
         print(f"    [Python triage] Gap hospitals: {len(gap_hospitals)}")
         print(f"    Factory covers demand: {covers}")
         for h in gap_hospitals:
-            print(f"      BRIDGE → {h['hospital_id']} ({h['hospital_name']}) "
+            print(f"      BRIDGE \u2192 {h['hospital_id']} ({h['hospital_name']}) "
                   f"| stockout {h['days_until_stockout']}d "
                   f"| bridge units: {h['bridge_units_needed']}")
         if covered_hids:
             print(f"    Covered by factory: {covered_hids}")
 
-    # No bridge needed — factory covers all hospitals through normal channels
+    # No bridge needed \u2014 factory covers all hospitals through normal channels
     if not gap_hospitals:
         result.update({
             "parse_ok":               True,
@@ -750,7 +765,7 @@ def run_procurement_agent(
             "option_a":               [],
             "option_b":               None,
             "caveats": [
-                "No emergency bridge order required — "
+                "No emergency bridge order required \u2014 "
                 "factory supply covers all hospitals through normal channels."
             ],
             "procurement_viable": True,
@@ -759,7 +774,57 @@ def run_procurement_agent(
             print("    No bridge needed.")
         return result
 
-    # Bridge order — single LLM call with multi-fill prompt
+    # \u2500\u2500 Micro-gap fast-path \u2014 TEMPORARILY DISABLED for parallel LLM call testing \u2500
+    # Re-enable: change `if False:` back to:
+    #   if all_moqs and total_bridge < min(all_moqs):
+    total_bridge = sum(h.get("bridge_units_needed", 0) for h in gap_hospitals)
+    all_moqs = [
+        d["min_order"]
+        for h in pkg.hospitals
+        for d in h.distributors
+        if h.hospital_id in {g["hospital_id"] for g in gap_hospitals}
+    ]
+    if MICRO_GAP_FAST_PATH and all_moqs and total_bridge < min(all_moqs):
+        print(f"  [FAST-PATH] {pkg.drug_name}: bridge={total_bridge} < min_moq={min(all_moqs)} — skipping LLM")
+        fast_assignments = {}
+        fast_caveats = [
+            f"Micro-gap fast-path: total bridge needed ({total_bridge:,} units) "
+            f"is below the minimum order quantity of every available distributor "
+            f"(smallest MOQ = {min(all_moqs):,}). Negotiation required for all options."
+        ]
+        for gh in gap_hospitals:
+            hid = gh["hospital_id"]
+            h_obj = next((h for h in pkg.hospitals if h.hospital_id == hid), None)
+            if not h_obj or not h_obj.distributors:
+                continue
+            in_time  = [d for d in h_obj.distributors if d["delivery_days"] < h_obj.days_until_stockout]
+            fallback = h_obj.distributors
+            pool = sorted(in_time or fallback, key=lambda d: -d["current_stock"])
+            if pool:
+                best = pool[0]
+                fast_assignments[hid] = [best["distributor_id"]]
+                fast_caveats.append(
+                    f"{hid}: assigned {best['distributor_id']} ({best['name']}) \u2014 "
+                    f"ordered {gh['bridge_units_needed']:,} < MOQ {best['min_order']:,} \u2014 negotiation required."
+                )
+        demand_override = {h["hospital_id"]: h.get("bridge_units_needed", 0) for h in gap_hospitals}
+        fast_option_a = _execute_order(fast_assignments, pkg, demand_override=demand_override)
+        result.update({
+            "parse_ok":             True,
+            "procurement_viable":  True,
+            "is_dicey_case":       False,
+            "bridge_order_summary": (
+                f"Micro-gap auto-resolve: {total_bridge:,} units needed across "
+                f"{len(gap_hospitals)} hospital(s). All distributor MOQs exceed this \u2014 negotiation required."
+            ),
+            "option_a":  fast_option_a,
+            "option_b":  None,
+            "caveats":   fast_caveats,
+        })
+        return result
+    # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    # Bridge order — LLM call (only reached if gap >= smallest MOQ)
     if verbose:
         print(f"    Bridge order for {len(gap_hospitals)} hospital(s)...")
     raw2 = _call_gemini(_build_bridge_prompt(pkg, gap_hospitals), max_tokens=4096)

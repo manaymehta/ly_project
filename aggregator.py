@@ -552,17 +552,32 @@ if __name__ == "__main__":
 
         return pkg, proc_result, clin_result
 
-    print(f"\n  Running agents in parallel for {len(packages)} package(s)...")
+    # Separate actionable (need LLM) from monitor-only (no calls needed)
+    llm_pkgs     = [p for p in packages if p.invoke_procurement or p.invoke_clinical]
+    monitor_pkgs = [p for p in packages if not p.invoke_procurement and not p.invoke_clinical]
 
-    # Use a single executor context
-    with ThreadPoolExecutor(max_workers=len(packages)) as executor:
+    # Print monitor-only immediately — no thread needed
+    for pkg in monitor_pkgs:
+        print(f"  [—] {pkg.drug_name} ({pkg.drug_id}) — monitor only")
+
+    print(f"\n  Running agents in parallel for {len(llm_pkgs)} package(s) (LLM)...")
+
+    # Use a single executor context — only for packages that invoke agents
+    with ThreadPoolExecutor(max_workers=max(1, len(llm_pkgs))) as executor:
         futures = {}
-        for pkg in packages:
+        for pkg in llm_pkgs:
             futures[executor.submit(_run_pkg, pkg)] = pkg
-            time.sleep(1.5)   # stagger submissions — avoids burst API calls
+            if pkg.invoke_procurement:
+                time.sleep(5)   # stagger LLM callers to avoid burst API calls
 
         for future in as_completed(futures):
-            pkg, proc_result, clin_result = future.result()
+            failed_pkg = futures[future]
+            try:
+                pkg, proc_result, clin_result = future.result()
+            except Exception as exc:
+                # One drug failing must NOT crash the rest of the pipeline.
+                print(f"\n  [✗] {failed_pkg.drug_name} ({failed_pkg.drug_id}) — LLM call failed: {type(exc).__name__}: {exc}")
+                continue
             with lock:
                 if proc_result is not None:
                     procurements[pkg.drug_id] = proc_result
@@ -570,13 +585,10 @@ if __name__ == "__main__":
                     clinicals[pkg.drug_id] = clin_result
 
                 # Print immediately under the lock — no interleaving between drugs
-                if not pkg.invoke_procurement:
-                    print(f"  [—] {pkg.drug_name} ({pkg.drug_id}) done | no procurement needed (monitor only)")
-                else:
-                    status = "✓" if (proc_result or {}).get("parse_ok") else "✗"
-                    print(f"\n  [{status}] {pkg.drug_name} ({pkg.drug_id}) complete")
-                    if proc_result:
-                        print_procurement_result(proc_result)
+                status = "✓" if (proc_result or {}).get("parse_ok") else "✗"
+                print(f"\n  [{status}] {pkg.drug_name} ({pkg.drug_id}) complete")
+                if proc_result:
+                    print_procurement_result(proc_result)
 
 
     # Aggregate once all results are collected

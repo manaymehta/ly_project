@@ -23,6 +23,7 @@ from typing import List, Optional
 from neo4j import GraphDatabase
 
 from sentinel import DisruptionEvent
+import session_manager
 
 NEO4J_URI      = "neo4j://127.0.0.1:7687"
 NEO4J_USER     = "neo4j"
@@ -206,11 +207,20 @@ def _fetch_distributor_options(
         "excl_id": exclude_distributor_id or "",
     })
 
-    # Group by hospital_id
+    # If a simulation session is active, override Neo4j stock values with
+    # live depleted values from session.db before grouping.
+    for row in rows:
+        row["drug_id"] = drug_id          # temp field needed by override
+    if session_manager.is_active():
+        rows = session_manager.override_analyst_stock(rows)
+
+    # Group by hospital_id — filter rows that became zero after depletion
     by_hospital = defaultdict(list)
     for row in rows:
         hid = row.pop("hospital_id")
-        by_hospital[hid].append(row)
+        row.pop("drug_id", None)          # clean up temp field
+        if row.get("current_stock", 0) > 0:
+            by_hospital[hid].append(row)
 
     return dict(by_hospital)
 
