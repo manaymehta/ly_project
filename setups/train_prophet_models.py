@@ -7,8 +7,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ── Load datasets ──────────────────────────────────────────────────────────────
-demand_history = pd.read_csv("demand_history.csv")
-drugs          = pd.read_csv("drugs.csv")
+demand_history = pd.read_csv("datasets/demand_history.csv")
+drugs          = pd.read_csv("datasets/drugs.csv")
 
 demand_history.columns = demand_history.columns.str.strip()
 drugs.columns          = drugs.columns.str.strip()

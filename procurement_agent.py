@@ -35,6 +35,7 @@ Key data facts:
 Install:    pip install google-genai
 """
 
+import re
 import json
 from typing import Optional
 from google import genai
@@ -43,7 +44,7 @@ from google.genai import types
 from analyst import DrugAlertPackage, HospitalRisk
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyCabOf6lHEd7QNsIXqwkiYDccfwAOMHeiM"
+GEMINI_API_KEY = "AIzaSyBsWNU1nC6Ntn0H4CaYtAaudchc39E1etA"
 GEMINI_MODEL   = "gemma-4-26b-a4b-it"   # ← change model name here if needed
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -88,23 +89,6 @@ def _drug_block(pkg: DrugAlertPackage) -> str:
     )
 
 
-def _hospitals_only_block(pkg: DrugAlertPackage) -> str:
-    """
-    Plain hospital list without distributor data.
-    Used in Call 1 (Allocation) where distributor context is intentionally absent.
-    """
-    lines = ["AFFECTED HOSPITALS (ranked by urgency — most urgent first)"]
-    for i, h in enumerate(pkg.hospitals, 1):
-        if not h.requires_action:
-            continue
-        exposed = max(0.0, pkg.recovery_days - h.days_until_stockout)
-        lines.append(
-            f"  {i}. [{h.hospital_id}] {h.hospital_name} ({h.hospital_city}) | {h.specialty_type}\n"
-            f"     Risk: {h.risk_level} | Stockout in: {h.days_until_stockout:.1f} days\n"
-            f"     Exposed for: {exposed:.1f} days\n"
-            f"     30-day demand forecast: {h.prophet_forecast_30d:,.0f} units"
-        )
-    return "\n".join(lines)
 
 
 def _hospitals_with_distributors_block(
@@ -205,284 +189,250 @@ def _hospitals_with_distributors_block(
     return "\n".join(lines)
 
 
-def _alternatives_block(pkg: DrugAlertPackage) -> str:
-    if not pkg.alternatives:
-        return "ALTERNATIVE DRUGS\n  None available."
-    lines = ["ALTERNATIVE DRUGS"]
-    for a in pkg.alternatives:
-        shared = a.get("shared_api_risk", False)
-        risk_note = (
-            "WARNING: SHARED API RISK — uses same disrupted API. "
-            "Supply also at risk — do not rely on this as fallback."
-            if shared
-            else "Safe — uses different API source."
-        )
-        lines.append(
-            f"  {a['alt_drug_id']} {a['alt_drug_name']} [{a['alt_criticality']}]\n"
-            f"    Similarity: {a['similarity_score']} | {risk_note}\n"
-            f"    Notes: {a['substitution_notes']}"
-        )
-    return "\n".join(lines)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# PATH 1 — SINGLE CALL (total supply loss)
+# PYTHON EXECUTION ENGINE — computes all numbers from LLM assignments
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_single_call_prompt(pkg: DrugAlertPackage) -> str:
-    task = (
-        "TASK\n"
-        "All supply of this drug from the disrupted source is lost.\n"
-        "Distributors hold existing stock to bridge the gap until supply recovers.\n\n"
-        "Each hospital section above lists its distributors sorted by speed with\n"
-        "delivery feasibility pre-computed for that hospital specifically.\n"
-        "BELOW MIN ORDER = negotiation may be required — do not auto-disqualify.\n"
-        "Consider these distributors if they offer better speed or cost.\n\n"
-        "Reason through ALL of the following in order:\n"
-        "  1. HOSPITAL PRIORITY: Rank all actionable hospitals by urgency\n"
-        "     (days_until_stockout ascending). Note which will run out before\n"
-        "     any distributor can reach them.\n"
-        "  2. PER-HOSPITAL ORDER: For each hospital, identify the best distributor\n"
-        "     considering in order: delivery feasibility (arrives before stockout),\n"
-        "     then stock sufficiency for that hospital's 30d forecast, then price.\n"
-        "  3. CONSOLIDATION: If multiple hospitals share the same best distributor,\n"
-        "     combine into one order. Split orders are fine when hospitals need\n"
-        "     different distributors.\n"
-        "  4. COVERAGE: For each order compute:\n"
-        "       units_required = hospital's 30-day forecast\n"
-        "       units_allocated = what you allocate to that hospital\n"
-        "     Flag any hospital where units_allocated < units_required.\n"
-        "  5. DICEY CASE: If two distributors are genuinely close in merit\n"
-        "     (e.g. one faster but below min-order, another slower but meets\n"
-        "     min-order and is cheaper), set is_dicey_case=true and populate\n"
-        "     both option_a and option_b with full order details and tradeoffs.\n"
-        "     Only flag as dicey when the choice is genuinely non-obvious.\n"
-        "  6. ALTERNATIVE DRUG: If shared_api_risk is True for all alternatives,\n"
-        "     state clearly no viable drug alternative exists.\n"
-        "  7. CAVEATS: Anything the reviewer must know before approving.\n\n"
-        "Respond with valid JSON only:\n"
-        "{\n"
-        '  "recommendation_summary": "<2-3 sentences>",\n'
-        '  "is_dicey_case": false,\n'
-        '  "dicey_tradeoff": null,\n'
-        '  "hospital_priority_order": [\n'
-        '    {\n'
-        '      "rank": 1,\n'
-        '      "hospital_id": "...",\n'
-        '      "hospital_name": "...",\n'
-        '      "days_until_stockout": ...,\n'
-        '      "units_required_30d": ...,\n'
-        '      "urgency_note": "<one sentence>"\n'
-        '    }\n'
-        '  ],\n'
-        '  "option_a": [\n'
-        '    {\n'
-        '      "distributor_id": "...",\n'
-        '      "distributor_name": "...",\n'
-        '      "total_quantity": ...,\n'
-        '      "price_per_unit": ...,\n'
-        '      "hospital_allocations": [\n'
-        '        {\n'
-        '          "hospital_id": "...",\n'
-        '          "hospital_name": "...",\n'
-        '          "delivery_days": ...,\n'
-        '          "units_required": ...,\n'
-        '          "units_allocated": ...,\n'
-        '          "coverage_note": "<ok or shortfall amount>"\n'
-        '        }\n'
-        '      ],\n'
-        '      "rationale": "<one sentence>"\n'
-        '    }\n'
-        '  ],\n'
-        '  "option_b": null,\n'
-        '  "total_stock_gap": ...,\n'
-        '  "alternative_drug_assessment": "<one sentence>",\n'
-        '  "caveats": ["<caveat 1>"],\n'
-        '  "procurement_viable": true\n'
-        "}\n\n"
-        "If is_dicey_case is true: populate option_b with same structure as option_a,\n"
-        "and set dicey_tradeoff to one sentence explaining what the human must decide.\n"
-        "option_a is always the primary recommendation."
-    )
-    return "\n\n".join([
-        _disruption_block(pkg),
-        _drug_block(pkg),
-        _hospitals_with_distributors_block(pkg),
-        _alternatives_block(pkg),
-        task,
-    ])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PATH 2 — TWO CALLS (partial supply loss)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _build_allocation_prompt(pkg: DrugAlertPackage) -> str:
+def _execute_order(
+    assignments:     dict,           # {hospital_id: str | list[str]} from LLM
+    pkg:             DrugAlertPackage,
+    demand_override: dict = None,    # {hospital_id: units_needed} — for bridge orders
+    unit_caps:       dict = None,    # {hospital_id: {distributor_id: int}} — from scratchpad extraction
+) -> list:
     """
-    Call 1 — Allocation triage.
-    No distributor data — purely about which hospitals have a gap
-    before normal resupply can arrive through standard channels (~14 days).
-
-    Pre-computes per hospital in Python before the LLM sees the prompt:
-      - min_delivery_days: fastest any distributor can reach that hospital
-      - needs_bridge: stock runs out before the fastest distributor arrives
-      - bridge_units: daily_demand × (min_delivery_days - days_until_stockout)
-        → covers exactly the gap from stockout to first possible delivery
-    LLM reads pre-computed labels — does not recalculate.
+    Converts LLM hospital→distributor assignment(s) into a fully-computed order list.
+    Supports both legacy single-string and new multi-fill list assignment formats.
+    Global stock pool depletes in hospital urgency order (earliest stockout first).
+    Exact-change rule: only draws what's needed, leaves the rest for later hospitals.
+    If unit_caps is provided, uses those exact amounts instead of greedy allocation
+    (honours the LLM's Universal Coverage capping decisions from the scratchpad).
     """
-    covers = pkg.drug_units_remaining >= pkg.system_total_forecast
+    if not assignments:
+        return []
 
-    # Pre-compute min delivery days per hospital from distributor data
-    hosp_min_delivery: dict[str, int] = {}
+    # Build distributor meta + per-(hospital, distributor) delivery days
+    dist_meta     = {}   # distributor_id → {name, city, current_stock, min_order, price}
+    hosp_delivery = {}   # (hospital_id, distributor_id) → delivery_days
     for h in pkg.hospitals:
-        if not h.requires_action:
-            continue
-        hosp_min_delivery[h.hospital_id] = (
-            min(d["delivery_days"] for d in h.distributors)
-            if h.distributors else 999
-        )
+        for d in h.distributors:
+            did = d["distributor_id"]
+            hosp_delivery[(h.hospital_id, did)] = d["delivery_days"]
+            if did not in dist_meta:
+                dist_meta[did] = {
+                    "name":          d["name"],
+                    "city":          d["city"],
+                    "current_stock": d["current_stock"],
+                    "min_order":     d["min_order"],
+                    "price_per_unit":d["price_per_unit"],
+                }
 
-    # Build labelled hospital section — all maths done here, not by the LLM
-    hosp_lines = []
+    # Hospital demand, urgency and name lookups
+    hosp_demand   = {}
+    hosp_stockout = {}
+    hosp_name     = {}
     for h in pkg.hospitals:
-        if not h.requires_action:
+        hosp_name[h.hospital_id]     = h.hospital_name
+        hosp_stockout[h.hospital_id] = h.days_until_stockout
+        if demand_override and h.hospital_id in demand_override:
+            hosp_demand[h.hospital_id] = demand_override[h.hospital_id]
+        else:
+            hosp_demand[h.hospital_id] = h.prophet_forecast_30d
+
+    # Normalise: values can be a string (legacy) or list (multi-fill)
+    normalised = {}
+    for hid, val in assignments.items():
+        if isinstance(val, list):
+            normalised[hid] = [v for v in val if v]
+        elif val:
+            normalised[hid] = [val]
+        else:
+            normalised[hid] = []
+
+    # Global shared stock pool — depleted across all hospitals
+    remaining = {did: dist_meta[did]["current_stock"] for did in dist_meta}
+
+    # Process hospitals in urgency order (earliest stockout first)
+    sorted_hids = sorted(normalised.keys(), key=lambda hid: hosp_stockout.get(hid, 9999))
+
+    # Accumulate per-distributor order records
+    dist_orders = {}   # distributor_id → order_record
+
+    for hid in sorted_hids:
+        dist_list      = normalised[hid]
+        units_needed   = round(hosp_demand.get(hid, 0))
+        remaining_need = units_needed
+
+        for did in dist_list:
+            if remaining_need <= 0:
+                break
+            if did not in dist_meta:
+                continue
+            avail = remaining.get(did, 0)
+            if avail <= 0:
+                continue
+
+            meta           = dist_meta[did]
+            # Use scratchpad-extracted cap if available, else greedy exact-change
+            if unit_caps and hid in unit_caps and did in unit_caps[hid]:
+                units_from_did = min(unit_caps[hid][did], avail)   # cap from LLM scratchpad
+            else:
+                units_from_did = min(remaining_need, avail)         # greedy exact-change
+            remaining[did] -= units_from_did
+            remaining_need -= units_from_did
+
+            delivery = hosp_delivery.get((hid, did))
+            stockout = hosp_stockout.get(hid, 0)
+            gap_days = round(max(0.0, (delivery or 0) - stockout), 1)
+
+            # Min-order advisory for this specific allocation
+            min_order     = meta.get("min_order", 0)
+            current_stock = meta.get("current_stock", 0)
+            if current_stock < min_order:
+                dist_caveat = (
+                    f"BELOW MIN ORDER: stock {current_stock:,} "
+                    f"< min {min_order:,} — negotiation required"
+                )
+            elif units_from_did < min_order:
+                dist_caveat = (
+                    f"BELOW MIN ORDER: ordered {units_from_did:,} "
+                    f"< min {min_order:,} — negotiation required"
+                )
+            else:
+                dist_caveat = None
+
+            coverage_note = (
+                "ok" if remaining_need == 0
+                else f"shortfall {remaining_need:,}"
+            )
+
+            alloc = {
+                "hospital_id":    hid,
+                "hospital_name":  hosp_name.get(hid, hid),
+                "delivery_days":  delivery,
+                "gap_days":       gap_days,
+                "units_required": units_needed,
+                "units_allocated":units_from_did,
+                "coverage_note":  coverage_note,
+            }
+
+            if did not in dist_orders:
+                dist_orders[did] = {
+                    "distributor_id":       did,
+                    "distributor_name":     f"{meta['name']} ({meta['city']})",
+                    "total_quantity":       0,
+                    "price_per_unit":       meta["price_per_unit"],
+                    "hospital_allocations": [],
+                }
+            if dist_caveat and "distributor_caveat" not in dist_orders[did]:
+                dist_orders[did]["distributor_caveat"] = dist_caveat
+
+            dist_orders[did]["total_quantity"]       += units_from_did
+            dist_orders[did]["hospital_allocations"].append(alloc)
+
+    # Any hospital that was assigned but got 0 (stock exhausted) still needs a row
+    allocated_hids = {
+        alloc["hospital_id"]
+        for order in dist_orders.values()
+        for alloc in order["hospital_allocations"]
+    }
+    for hid in sorted_hids:
+        if hid in allocated_hids:
             continue
-        min_del       = hosp_min_delivery.get(h.hospital_id, 999)
-        daily_demand  = h.prophet_forecast_30d / 30.0
-        exposed_days  = max(0.0, pkg.recovery_days - h.days_until_stockout)
-        bridge_units  = round(daily_demand * exposed_days)
-        needs_bridge  = h.days_until_stockout < pkg.recovery_days
-        hosp_lines.append(
-            f"  [{h.hospital_id}] {h.hospital_name} | "
-            f"Stockout in {h.days_until_stockout:.1f}d | "
-            f"Recovery in {pkg.recovery_days}d | "
-            f"Fastest distributor: {min_del}d | "
-            f"{'NEEDS BRIDGE — runs out before factory recovers' if needs_bridge else 'covered — stock lasts full recovery'} | "
-            f"Exposed window: {exposed_days:.1f}d | Bridge units: {bridge_units:,}"
-        )
-    hosp_section = "HOSPITAL BRIDGE ANALYSIS\n" + "\n".join(hosp_lines)
+        # Use first valid distributor in assignment list
+        first_did = next((d for d in normalised[hid] if d in dist_meta), None)
+        if not first_did:
+            continue
+        meta     = dist_meta[first_did]
+        delivery = hosp_delivery.get((hid, first_did))
+        stockout = hosp_stockout.get(hid, 0)
+        gap_days = round(max(0.0, (delivery or 0) - stockout), 1)
+        need     = round(hosp_demand.get(hid, 0))
+        if first_did not in dist_orders:
+            dist_orders[first_did] = {
+                "distributor_id":       first_did,
+                "distributor_name":     f"{meta['name']} ({meta['city']})",
+                "total_quantity":       0,
+                "price_per_unit":       meta["price_per_unit"],
+                "hospital_allocations": [],
+            }
+        dist_orders[first_did]["hospital_allocations"].append({
+            "hospital_id":    hid,
+            "hospital_name":  hosp_name.get(hid, hid),
+            "delivery_days":  delivery,
+            "gap_days":       gap_days,
+            "units_required": need,
+            "units_allocated": 0,
+            "coverage_note":  f"shortfall {need:,} (stock exhausted)",
+        })
 
-    covers_str = "COVERS" if covers else "DOES NOT COVER"
-    task = (
-        "TASK — ALLOCATION DECISION\n"
-        f"The disrupted source is partially offline. Remaining factory supply:\n"
-        f"  {pkg.drug_units_remaining:,.0f} units/month from other producers\n"
-        f"  {pkg.system_total_forecast:,.0f} units total 30-day system demand\n"
-        f"  Factory supply {covers_str} total demand.\n\n"
-        "A hospital NEEDS BRIDGE if its current stock runs out before the factory\n"
-        f"recovers (~{pkg.recovery_days} days). The exposed window and bridge units\n"
-        "are already computed above — use them directly.\n\n"
-        "Reason through:\n"
-        "  1. Which hospitals are marked NEEDS BRIDGE? List them.\n"
-        "  2. For each NEEDS BRIDGE hospital, use the pre-computed bridge_units directly.\n"
-        "     Do NOT recalculate — use the figure shown in the analysis above.\n"
-        "  3. Rank by severity (largest bridge_units first).\n\n"
-        "Respond with valid JSON only:\n"
-        "{\n"
-        '  "allocation_summary": "<2-3 sentences>",\n'
-        f'  "factory_covers_demand": {str(covers).lower()},\n'
-        '  "hospitals_needing_bridge": [\n'
-        '    {\n'
-        '      "hospital_id": "...",\n'
-        '      "hospital_name": "...",\n'
-        '      "days_until_stockout": ...,\n'
-        '      "fastest_delivery_days": ...,\n'
-        '      "gap_days": ...,\n'
-        '      "bridge_units_needed": ...,\n'
-        '      "priority": 1\n'
-        '    }\n'
-        '  ],\n'
-        '  "hospitals_covered_by_factory": ["H001", "H002"],\n'
-        '  "allocation_note": "<one sentence>"\n'
-        "}"
-    )
-    return "\n\n".join([
-        _disruption_block(pkg),
-        _drug_block(pkg),
-        hosp_section,
-        task,
-    ])
+    return list(dist_orders.values())
 
 
-def _build_bridge_order_prompt(
-    pkg:        DrugAlertPackage,
-    allocation: dict,
-) -> str:
-    """
-    Call 2 — Bridge order.
-    Focused only on gap hospitals identified by Call 1.
-    Uses per-hospital distributor block for focused context.
-    """
-    gap_hospitals = allocation.get("hospitals_needing_bridge", [])
-    gap_hids      = [h["hospital_id"] for h in gap_hospitals]
 
-    if not gap_hids:
-        return ""
+# ── New prompt builders (migrated from test_prompt_comparison.py) ─────────────
 
-    gap_lines = []
-    for h in gap_hospitals:
-        gap_lines.append(
-            f"  {h['hospital_id']} ({h.get('hospital_name', '')}) | "
-            f"Stockout in {h['days_until_stockout']} days | "
-            f"Bridge needed: {h.get('bridge_units_needed', '?')} units"
-        )
-    gap_section = (
-        "HOSPITALS NEEDING BRIDGE ORDER (from allocation — Call 1)\n" +
-        "\n".join(gap_lines)
-    )
 
-    task = (
+def _build_task(gap_hospitals: list) -> str:
+    """Task section for the bridge order LLM call — multi-fill, dual-strategy."""
+    sorted_hids  = [h["hospital_id"] for h in sorted(gap_hospitals, key=lambda h: h["days_until_stockout"])]
+    total_needed = sum(h["bridge_units_needed"] for h in gap_hospitals)
+    return (
         f"TASK — BRIDGE ORDER DECISION\n"
-        f"{len(gap_hospitals)} hospital(s) will run out before normal resupply arrives.\n"
-        f"{allocation.get('allocation_note', '')}\n\n"
-        "Reason through:\n"
-        "  1. Per gap hospital: which distributors arrive before stockout?\n"
-        "  2. Does that distributor have sufficient stock for bridge_units_needed?\n"
-        "     If below min-order, flag for negotiation — still consider if best option.\n"
-        "  3. Consolidate: if multiple hospitals share same best distributor, combine.\n"
-        "  4. units_allocated = max(bridge_units_needed, min_order), capped at current_stock.\n"
-        "     If min_order > current_stock, use current_stock and flag shortfall.\n"
-        "  5. DICEY CASE: if two distributors are genuinely close in merit for a hospital,\n"
-        "     set is_dicey_case=true and provide option_a and option_b.\n"
-        "  6. Flag any hospital that cannot be served in time by any distributor.\n\n"
-        "Respond with valid JSON only:\n"
-        "{\n"
-        '  "bridge_order_summary": "<2-3 sentences>",\n'
-        '  "is_dicey_case": false,\n'
-        '  "dicey_tradeoff": null,\n'
-        '  "option_a": [\n'
-        '    {\n'
-        '      "distributor_id": "...",\n'
-        '      "distributor_name": "...",\n'
-        '      "total_quantity": ...,\n'
-        '      "price_per_unit": ...,\n'
-        '      "hospital_allocations": [\n'
-        '        {\n'
-        '          "hospital_id": "...",\n'
-        '          "hospital_name": "...",\n'
-        '          "delivery_days": ...,\n'
-        '          "units_required": ...,\n'
-        '          "units_allocated": ...,\n'
-        '          "coverage_note": "<ok or shortfall>"\n'
-        '        }\n'
-        '      ],\n'
-        '      "rationale": "<one sentence>"\n'
-        '    }\n'
-        '  ],\n'
-        '  "option_b": null,\n'
-        '  "hospitals_unserviceable": [],\n'
-        '  "total_bridge_cost_estimate": ...,\n'
-        '  "caveats": ["<caveat 1>"],\n'
-        '  "bridge_viable": true\n'
-        "}\n\n"
-        "If is_dicey_case is true: populate option_b and set dicey_tradeoff."
+        f"Total bridge units needed: {total_needed:,} across {len(gap_hospitals)} hospitals.\n\n"
+        f"Process hospitals in this urgency order (most urgent first): {', '.join(sorted_hids)}\n\n"
+        f"STRATEGY DEFINITIONS (CRITICAL):\n"
+        f"  - OPTION A (Universal Coverage): If demand exceeds supply, do NOT let the bottom hospitals starve. "
+        f"    Manually reduce the units assigned to top-priority hospitals to leave a 'Survival Reserve' in the global pool. "
+        f"    Every hospital MUST receive at least a partial allocation.\n"
+        f"  - OPTION B (Ruthless Triage): Process strictly top-down. Give top-priority hospitals 100% of their need "
+        f"    until the global pool hits 0. Let the bottom hospitals starve if necessary.\n\n"
+        f"STOCK RULE: Each distributor has ONE total stock pool. If you assign distributor X\n"
+        f"to hospital A, that uses up stock from that distributor X. Assign the same distributor to a second\n"
+        f"hospital only if its current_stock can cover both hospitals' bridge_units_needed combined.\n\n"
+        f"For each hospital (process strictly in the order above):\n"
+        f"  1. Start with ARRIVES IN TIME distributors. If one has enough stock to fully cover the need, assign it.\n"
+        f"  2. MULTI-FILL: If an ARRIVES IN TIME distributor's stock is too small (e.g. S009 with 146 units for a hospital needing thousands),\n"
+        f"     assign it to bridge the immediate gap, AND ALSO assign an ARRIVES AFTER STOCKOUT distributor to cover the rest of the volume.\n"
+        f"  3. If no in-time options exist, assign the ARRIVES AFTER STOCKOUT distributor with the most stock.\n"
+        f"  4. Flag BELOW MIN ORDER situations in caveats — do not disqualify for this alone.\n\n"
+        f"MATH RULES FOR MULTI-FILL:\n"
+        f"  - Stop Condition: Stop adding distributors to a hospital the moment its cumulative assigned units >= its target (or full need).\n"
+        f"  - Exact Change: Only draw exactly what you need to fill the gap. If a distributor has 5,000 units "
+        f"    and you only need 1,000, subtract 1,000 and explicitly leave 4,000 in the global pool for other hospitals.\n"
+        f"  - Minimum Order Check: Compare your 'exact change' assigned units to the distributor's minimum order requirement. "
+        f"    If the assigned amount is less than the minimum order, you MUST flag it in the 'caveats' array.\n\n"
+        f"Respond with valid JSON only. You MUST show your step-by-step math for Option A in the 'option_a_scratchpad' FIRST:\n"
+        f"{{\n"
+        f'  "option_a_scratchpad": {{"<HOSPITAL ID>": "<If shortage, state reduced target to save reserve. Explain Exact Change, Min Order check, and updated global stock here>"}},\n'
+        f'  "bridge_order_summary": "<2-3 sentences>",\n'
+        f'  "is_dicey_case": true or false,\n'
+        f'  "dicey_tradeoff": "<description of the tradeoff between Universal Coverage and Ruthless Triage>",\n'
+        f'  "option_a_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
+        f'  "option_a_strategy": "Universal Coverage: Manually reduced top allocations to guarantee survival stock for all hospitals.",\n'
+        f'  "option_b_scratchpad": {{"<HOSPITAL ID>": "<RESET ALL STOCK POOLS TO ORIGINAL VALUES. Apply Ruthless Triage: Feed top hospitals 100% until stock is 0. Explain math here>"}},\n'
+        f'  "option_b_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
+        f'  "option_b_strategy": "Ruthless Triage: Guaranteed 100% coverage for highest urgency, sacrificing lowest urgency.",\n'
+        f'  "hospitals_unserviceable": [],\n'
+        f'  "caveats": ["<caveat>"]\n'
+        f"}}\n"
     )
+
+
+def _build_bridge_prompt(pkg: DrugAlertPackage, gap_hospitals: list) -> str:
+    """Assembles the full bridge-order LLM prompt from context blocks + task."""
+    gap_hids  = [h["hospital_id"] for h in gap_hospitals]
+    gap_lines = [
+        f"  {h['hospital_id']} ({h.get('hospital_name', '')}) | "
+        f"Stockout in {h['days_until_stockout']}d | Bridge needed: {h['bridge_units_needed']:,} units"
+        for h in gap_hospitals
+    ]
+    gap_section = "HOSPITALS NEEDING BRIDGE ORDER (Python-computed)\n" + "\n".join(gap_lines)
     return "\n\n".join([
         _disruption_block(pkg),
         _drug_block(pkg),
         gap_section,
         _hospitals_with_distributors_block(pkg, hospital_ids=gap_hids),
-        task,
+        _build_task(gap_hospitals),
     ])
 
 
@@ -503,40 +453,206 @@ def _call_gemini(prompt: str, max_tokens: int = 2048) -> str:
     return response.text or ""
 
 
+def _strip_scratchpads(text: str) -> str:
+    """Remove option_a_scratchpad / option_b_scratchpad using brace-matched extraction."""
+    result = text
+    for field in ("option_a_scratchpad", "option_b_scratchpad"):
+        m = re.search(f'"{field}"\\s*:', result)
+        if not m:
+            continue
+        start = m.end()
+        while start < len(result) and result[start] in ' \t\n\r':
+            start += 1
+        if start >= len(result) or result[start] != '{':
+            continue
+        depth, in_str, esc = 0, False, False
+        i = start
+        while i < len(result):
+            c = result[i]
+            if esc:
+                esc = False
+            elif c == '\\' and in_str:
+                esc = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':   depth += 1
+                elif c == '}': depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    while end < len(result) and result[end] in ' \t':
+                        end += 1
+                    if end < len(result) and result[end] == ',':
+                        end += 1
+                    result = result[:m.start()] + result[end:]
+                    break
+            i += 1
+    return result
+
+
 def _parse_json(raw: str) -> tuple[dict, bool, str]:
     """Returns (parsed_dict, success, error_msg). Never raises."""
     if raw is None or not raw.strip():
         return {}, False, "LLM returned empty or None response"
+    clean = raw.strip()
+    if clean.startswith("```"):
+        parts = clean.split("```")
+        clean = parts[1]
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip()
+    # First attempt: parse as-is
     try:
-        clean = raw.strip()
-        if clean.startswith("```"):
-            parts = clean.split("```")
-            clean = parts[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-        return json.loads(clean.strip()), True, ""
+        return json.loads(clean), True, ""
+    except (json.JSONDecodeError, IndexError):
+        pass
+    # Fallback: strip scratchpad fields (inline corrections can break json.loads)
+    try:
+        stripped = _strip_scratchpads(clean)
+        result   = json.loads(stripped)
+        result["_scratchpad_stripped"] = True
+        return result, True, "scratchpad stripped"
     except (json.JSONDecodeError, IndexError) as e:
         return {}, False, str(e)
 
 
-def _parse_error_result(drug_id, drug_name, scenario, err, raw, call_num) -> dict:
+def _parse_error_result(
+    drug_id:   str,
+    drug_name: str,
+    error_msg: str,
+    raw_text:  str,
+    call_num:  int,
+) -> dict:
     return {
         "drug_id":                drug_id,
         "drug_name":              drug_name,
-        "scenario":               scenario,
         "parse_ok":               False,
-        "parse_error":            err,
-        f"raw_response_call{call_num}": raw,
+        f"raw_response_call{call_num}": raw_text,
+        "parse_error":            error_msg,
         "recommendation_summary": f"Call {call_num} parse failed — see raw_response.",
         "hospital_priority_order":[],
         "option_a":               [],
         "option_b":               None,
         "is_dicey_case":          False,
-        "alternative_drug_assessment": "N/A",
         "caveats":                ["LLM response could not be parsed as JSON."],
         "procurement_viable":     False,
         "call_count":             call_num,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESULT PRINTER  (standalone — reads from result dict, safe to call anywhere)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_procurement_result(result: dict) -> None:
+    """Pretty-print the full Option A / Option B tables from a result dict.
+
+    Reads entirely from the result dict — no agent context needed.
+    Safe to call from the aggregator after future.result().
+    """
+    COL = [8, 12, 10, 8, 8, 6, 10, 9]
+    HDR = ["Hospital", "Distributor", "Full Need", "Remainin", "Given", "Gap d", "Coverage", "Min Ord?"]
+    W   = sum(COL) + len(COL) * 5 + 1
+
+    def _hdr(title):
+        pad = max(0, W - len(title) - 2)
+        print(f"\n  +{'-'*(W+2)}+")
+        print(f"  | {title}{' '*pad} |")
+        print(f"  +{'-'*(W+2)}+")
+
+    def _row(*cols):
+        parts = [str(c)[:w].ljust(w) for c, w in zip(cols, COL)]
+        print("  | " + " | ".join(parts) + " |")
+
+    def _div():
+        print(f"  +{'-'*(W+2)}+")
+
+    def _print_table(label, orders_list, strategy=""):
+        if not orders_list:
+            return
+        title = f"{label}  --  {strategy}" if strategy else label
+        _hdr(title)
+        _row(*HDR)
+        _div()
+
+        cumulative = {}
+        raw_allocs = []
+        for order in orders_list:
+            cav = order.get("distributor_caveat", "")
+            did = order.get("distributor_id", "?")
+            for alloc in order.get("hospital_allocations", []):
+                raw_allocs.append((alloc, did, cav))
+
+        seen_hids, allocs_by_hid = [], {}
+        for item in raw_allocs:
+            hid = item[0].get("hospital_id", "?")
+            if hid not in allocs_by_hid:
+                allocs_by_hid[hid] = []
+                seen_hids.append(hid)
+            allocs_by_hid[hid].append(item)
+
+        all_allocs = []
+        for hid in seen_hids:
+            all_allocs.extend(allocs_by_hid[hid])
+
+        prev_hid = None
+        for alloc, did, cav in all_allocs:
+            hid = alloc.get("hospital_id", "?")
+            if prev_hid is not None and hid != prev_hid:
+                print("  |" + " " * (W + 2) + "|")
+            prev_hid = hid
+
+            full_need        = alloc.get("units_required", 0)
+            given_now        = alloc.get("units_allocated", 0)
+            prev_given       = cumulative.get(hid, 0)
+            remaining_before = max(0, full_need - prev_given)
+            cumulative[hid]  = prev_given + given_now
+            remaining_after  = max(0, full_need - cumulative[hid])
+
+            gap  = f"{alloc.get('gap_days', 0):.1f}d"
+            cov  = "ok" if remaining_after == 0 else f"-{remaining_after:,}"
+            mord = "NEG" if cav else "ok"
+
+            _row(hid, did, f"{full_need:,}", f"{remaining_before:,}",
+                 f"{given_now:,}", gap, cov, mord)
+        _div()
+
+    # ── Summary line ──
+    bridge     = result.get("bridge_order", {})
+    gap_count  = len(result.get("allocation", {}).get("hospitals_needing_bridge", []))
+    print(f"\n  Drug : {result.get('drug_name')} ({result.get('drug_id')})")
+    print(f"  Gap hospitals : {gap_count}"
+          f"  |  Stock gap : {result.get('total_stock_gap', 0):,} units"
+          f"  |  Parse ok : {result.get('parse_ok')}"
+          f"  |  Viable : {result.get('procurement_viable')}")
+    if result.get("_scratchpad_stripped"):
+        print("  [!] Scratchpad stripped during JSON parse — assignments still valid.")
+
+    # ── Option A ──
+    strat_a = bridge.get("option_a_strategy", "Option A")
+    _print_table("OPTION A", result.get("option_a", []), strat_a)
+
+    # ── Option B (dicey) ──
+    if result.get("is_dicey_case"):
+        print(f"\n  [!] DICEY CASE:")
+        tradeoff = result.get("dicey_tradeoff", "")
+        for line in (tradeoff or "").split(". "):
+            if line.strip():
+                print(f"      {line.strip()}.")
+        strat_b = bridge.get("option_b_strategy", "Option B")
+        _print_table("OPTION B", result.get("option_b") or [], strat_b)
+    else:
+        print("\n  [ok] Not a dicey case — single recommendation.")
+
+    # ── Caveats ──
+    caveats = result.get("caveats", [])
+    if caveats:
+        print(f"\n  {'─'*70}")
+        print("  CAVEATS:")
+        for c in caveats:
+            print(f"    [!] {c}")
+        print(f"  {'─'*70}")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -560,140 +676,215 @@ def run_procurement_agent(
     scenario      = "TOTAL_LOSS" if is_total_loss else "PARTIAL_LOSS"
 
     if verbose:
-        print(f"\n  [Procurement Agent] {pkg.drug_name} ({pkg.drug_id}) | {scenario}")
+        print(f"\n  [Procurement Agent] {pkg.drug_name} ({pkg.drug_id})")
 
-    result = {"drug_id": pkg.drug_id, "drug_name": pkg.drug_name, "scenario": scenario}
+    result = {"drug_id": pkg.drug_id, "drug_name": pkg.drug_name}
 
-    # ── PATH 1: Single call — total supply loss ────────────────────────────────
-    if is_total_loss:
-        if verbose:
-            print("    → Single-call path")
+    # ── Two-call path (all scenarios) ─────────────────────────────────────────
+    # ── Python triage (replaces LLM Call 1) ──────────────────────────────────
+    # needs_bridge = True when the hospital runs out BEFORE the factory recovers.
+    # All arithmetic was already pre-computed in the old Call 1 prompt — the LLM
+    # was just reading the labels back. Python does it directly here.
+    covers             = pkg.drug_units_remaining >= pkg.system_total_forecast
+    factory_covers_str = "COVERS" if covers else "DOES NOT COVER"
 
-        raw    = _call_gemini(_build_single_call_prompt(pkg))
-        parsed, ok, err = _parse_json(raw)
+    gap_hospitals  = []
+    covered_hids   = []
 
-        if not ok:
-            return _parse_error_result(
-                pkg.drug_id, pkg.drug_name, scenario, err, raw, 1)
-
-        result.update(parsed)
-        result["parse_ok"]   = True
-        result["call_count"] = 1
-
-    # ── PATH 2: Two calls — partial supply loss ────────────────────────────────
-    else:
-        if verbose:
-            print("    → Two-call path (allocation → bridge order)")
-
-        # Call 1: Allocation
-        if verbose:
-            print("    Call 1: Allocation...")
-        raw1 = _call_gemini(_build_allocation_prompt(pkg), max_tokens=1024)
-        allocation, ok1, err1 = _parse_json(raw1)
-
-        if not ok1:
-            return _parse_error_result(
-                pkg.drug_id, pkg.drug_name, scenario, err1, raw1, 1)
-
-        result["allocation"] = allocation
-        gap_hospitals = allocation.get("hospitals_needing_bridge", [])
-
-        # ── Safety guard for hospital IDs ────────────────────────────────────
-        real_ids = {h.hospital_id for h in pkg.hospitals}
-        for gh in gap_hospitals:
-            if gh.get("hospital_id", "") not in real_ids:
-                if verbose:
-                    print(f"    WARNING: Unrecognised hospital_id '{gh.get('hospital_id', '')}' "
-                          f"returned by Call 1 — excluded from distributor block.")
-
-        if verbose:
-            print(f"    Call 1 done. Gap hospitals: {len(gap_hospitals)}")
-
-        # No bridge needed — factory covers all
-        if not gap_hospitals:
-            result.update({
-                "parse_ok":               True,
-                "call_count":             1,
-                "bridge_order":           None,
-                "recommendation_summary": allocation.get("allocation_summary", ""),
-                "is_dicey_case":          False,
-                "option_a":               [],
-                "option_b":               None,
-                "caveats": [
-                    "No emergency bridge order required — "
-                    "factory supply covers all hospitals through normal channels."
-                ],
-                "procurement_viable": True,
+    for h in pkg.hospitals:
+        if not h.requires_action:
+            continue
+        needs_bridge = h.days_until_stockout < pkg.recovery_days
+        if needs_bridge:
+            exposed_days = max(0.0, pkg.recovery_days - h.days_until_stockout)
+            bridge_units = round((h.prophet_forecast_30d / 30.0) * exposed_days)
+            gap_hospitals.append({
+                "hospital_id":         h.hospital_id,
+                "hospital_name":       h.hospital_name,
+                "days_until_stockout": round(h.days_until_stockout, 1),
+                "bridge_units_needed": bridge_units,
             })
-            if verbose:
-                print("    No bridge needed.")
-            return result
+        else:
+            covered_hids.append(h.hospital_id)
 
-        # Call 2: Bridge order
-        if verbose:
-            print(f"    Call 2: Bridge order for {len(gap_hospitals)} hospital(s)...")
-        raw2 = _call_gemini(
-            _build_bridge_order_prompt(pkg, allocation), max_tokens=2048)
-        bridge, ok2, err2 = _parse_json(raw2)
+    # Build allocation dict with same field names the old LLM Call 1 returned —
+    # all downstream code (result["allocation"], bridge prompt, verbose) unchanged.
+    gap_summary = ", ".join(
+        f"{h['hospital_id']} ({h['days_until_stockout']}d)" for h in gap_hospitals
+    )
+    allocation = {
+        "factory_covers_demand":        covers,
+        "hospitals_needing_bridge":     [h["hospital_id"] for h in gap_hospitals],
+        "hospitals_covered_by_factory": covered_hids,
+        "allocation_summary": (
+            f"Factory supply {factory_covers_str} total 30-day system demand. "
+            f"{len(gap_hospitals)} hospital(s) require emergency bridge orders: "
+            f"{gap_summary or 'none'}."
+        ),
+        "allocation_note": (
+            f"Bridge required for {len(gap_hospitals)} hospital(s). "
+            f"Factory supply {factory_covers_str.lower()} total demand."
+        ),
+    }
 
-        if not ok2:
-            result.update(
-                _parse_error_result(
-                    pkg.drug_id, pkg.drug_name, scenario, err2, raw2, 2))
-            result["allocation"] = allocation
-            return result
+    result["allocation"] = allocation
 
+    if verbose:
+        print(f"    [Python triage] Gap hospitals: {len(gap_hospitals)}")
+        print(f"    Factory covers demand: {covers}")
+        for h in gap_hospitals:
+            print(f"      BRIDGE → {h['hospital_id']} ({h['hospital_name']}) "
+                  f"| stockout {h['days_until_stockout']}d "
+                  f"| bridge units: {h['bridge_units_needed']}")
+        if covered_hids:
+            print(f"    Covered by factory: {covered_hids}")
+
+    # No bridge needed — factory covers all hospitals through normal channels
+    if not gap_hospitals:
         result.update({
             "parse_ok":               True,
-            "call_count":             2,
-            "bridge_order":           bridge,
-            "recommendation_summary": (
-                allocation.get("allocation_summary", "") + " " +
-                bridge.get("bridge_order_summary", "")
-            ).strip(),
-            "is_dicey_case":  bridge.get("is_dicey_case", False),
-            "dicey_tradeoff": bridge.get("dicey_tradeoff"),
-            "option_a":       bridge.get("option_a", []),
-            "option_b":       bridge.get("option_b"),
-            "procurement_viable": bridge.get("bridge_viable", False),
-            "caveats":        bridge.get("caveats", []),
+            "call_count":             0,
+            "bridge_order":           None,
+            "recommendation_summary": allocation["allocation_summary"],
+            "is_dicey_case":          False,
+            "option_a":               [],
+            "option_b":               None,
+            "caveats": [
+                "No emergency bridge order required — "
+                "factory supply covers all hospitals through normal channels."
+            ],
+            "procurement_viable": True,
         })
+        if verbose:
+            print("    No bridge needed.")
+        return result
 
-    # ── Verbose summary ────────────────────────────────────────────────────────
+    # Bridge order — single LLM call with multi-fill prompt
     if verbose:
-        summary = result.get("recommendation_summary", "")
-        print(f"    Summary: {summary[:120]}...")
+        print(f"    Bridge order for {len(gap_hospitals)} hospital(s)...")
+    raw2 = _call_gemini(_build_bridge_prompt(pkg, gap_hospitals), max_tokens=4096)
 
-        orders = result.get("option_a", [])
-        print(f"    Orders (option_a): {len(orders)}")
-        for o in orders:
-            for alloc in o.get("hospital_allocations", []):
-                print(f"      {alloc.get('hospital_id')} — "
-                      f"need={alloc.get('units_required')} "
-                      f"get={alloc.get('units_allocated')} "
-                      f"({alloc.get('coverage_note', '')})")
+    # Save Call 1 raw response immediately — per-drug file under raw_output/
+    import pathlib
+    raw_out_dir = pathlib.Path("raw_output")
+    raw_out_dir.mkdir(exist_ok=True)
+    _raw_log = raw_out_dir / f"{pkg.drug_id}_{pkg.drug_name.replace(' ', '_')}_llm.txt"
+    with open(_raw_log, "w", encoding="utf-8") as _fp:
+        _fp.write("=== CALL 1: Bridge Order (scratchpad + assignments) ===\n\n")
+        _fp.write(raw2)
 
-        if result.get("is_dicey_case"):
-            print(f"    ⚠ DICEY CASE: {result.get('dicey_tradeoff')}")
-            opt_b = result.get("option_b", [])
-            print(f"    Option B orders: {len(opt_b) if opt_b else 0}")
+    bridge, ok2, err2 = _parse_json(raw2)
 
-        alt = result.get("alternative_drug_assessment")
-        if alt:
-            print(f"    Alternative: {alt}")
+    if not ok2:
+        result.update(
+            _parse_error_result(
+                pkg.drug_id, pkg.drug_name, err2, raw2, 2))
+        result["allocation"] = allocation
+        return result
 
-        for c in result.get("caveats", []):
-            print(f"    Caveat: {c}")
+    # LLM gives assignments {hospital_id: distributor_id}
+    # Python computes all numeric allocations using bridge_units_needed as demand
+    demand_override = {
+        h["hospital_id"]: h.get("bridge_units_needed", 0)
+        for h in gap_hospitals
+    }
+    a_assign = bridge.get("option_a_assignments") or {}
+    b_assign = bridge.get("option_b_assignments") or {}
 
-        print(f"    viable={result.get('procurement_viable')} "
-              f"parse_ok={result.get('parse_ok')} "
-              f"calls={result.get('call_count')}")
+    # ── Call 2: lightweight scratchpad extraction ─────────────────────────────
+    # Read the scratchpad text and extract {hospital_id: {distributor_id: units}}
+    # for both options, so Python can honour the LLM's capping decisions.
+    a_scratchpad = bridge.get("option_a_scratchpad", {})
+    b_scratchpad = bridge.get("option_b_scratchpad", {})
+    a_caps, b_caps = {}, {}
+    if a_scratchpad or b_scratchpad:
+        extract_prompt = (
+        "You are a strict data extraction parser. Your ONLY job is to convert the final stated "
+        "allocations from the text into a single JSON object.\n\n"
+        "RULES:\n"
+        "1. IGNORE ALL MATH AND REASONING (e.g., 'Need x', 'Remaining y', 'Total available').\n"
+        "2. If there is a 'REVISED' or 'Final:' summary at the end of a text block, use ONLY that summary. "
+        "If there is no summary, extract the final assigned values directly from each hospital's explanation.\n"
+        "3. Be careful to distinguish assigned units from remaining global stock (e.g., in 'distributor id (146)... distributor id: 0', the assignment is 146, and 0 is the leftover stock).\n"
+        "4. Omit distributors if the assigned value is 0.\n"
+        "5. Output absolutely nothing but valid JSON.\n\n"
+        "EXPECTED FORMAT:\n"
+        "{\n"
+        '  "option_a": {"<HOSPITAL_ID>": {"<DISTRIBUTOR_ID>": <integer>, ...}},\n'
+        '  "option_b": {"<HOSPITAL_ID>": {"<DISTRIBUTOR_ID>": <integer>, ...}}\n'
+        "}\n\n"
+        f"--- OPTION A TEXT ---\n{json.dumps(a_scratchpad)}\n\n"
+        f"--- OPTION B TEXT ---\n{json.dumps(b_scratchpad)}"
+        )
+        if verbose:
+            print("    [Extracting caps from scratchpad...]")
+        raw_extract = _call_gemini(extract_prompt, max_tokens=1024)
+        with open(_raw_log, "a", encoding="utf-8") as _fp:
+            _fp.write("\n\n=== CALL 2: Scratchpad Extraction (caps) ===\n\n")
+            _fp.write(raw_extract)
+        extracted, ok_e, _ = _parse_json(raw_extract)
+        if ok_e:
+            a_caps = extracted.get("option_a", {})
+            b_caps = extracted.get("option_b", {})
+            if verbose:
+                print(f"    [Caps extracted: A={len(a_caps)} hospitals, B={len(b_caps)} hospitals]")
+        else:
+            if verbose:
+                print("    [Scratchpad extraction failed — falling back to greedy allocation]")
+
+    option_a = _execute_order(a_assign, pkg, demand_override, unit_caps=a_caps or None)
+    option_b = _execute_order(b_assign, pkg, demand_override, unit_caps=b_caps or None) if b_assign else None
+
+
+
+    # Compute total_stock_gap
+    total_required = sum(round(h["bridge_units_needed"]) for h in gap_hospitals)
+    total_acquired = sum(
+        alloc["units_allocated"]
+        for order in option_a
+        for alloc in order["hospital_allocations"]
+    )
+    total_stock_gap = max(0, total_required - total_acquired)
+
+    all_caveats = list(bridge.get("caveats", []))
+    for order in option_a:
+        if "distributor_caveat" in order:
+            all_caveats.append(f"{order['distributor_name']}: {order['distributor_caveat']}")
+    for order in option_a:
+        for alloc in order["hospital_allocations"]:
+            gd = alloc.get("gap_days", 0)
+            if gd > 0:
+                all_caveats.append(
+                    f"ZERO STOCK GAP - {alloc['hospital_name']} ({alloc['hospital_id']}): "
+                    f"{gd}d without supply (delivery day {alloc.get('delivery_days', '?')})."
+                )
+
+    result.update({
+        "parse_ok":               True,
+        "call_count":             2,
+        "bridge_order":           bridge,
+        "recommendation_summary": (
+            allocation.get("allocation_summary", "") + " " +
+            bridge.get("bridge_order_summary", "")
+        ).strip(),
+        "is_dicey_case":  bridge.get("is_dicey_case", False),
+        "dicey_tradeoff": bridge.get("dicey_tradeoff"),
+        "option_a":       option_a,
+        "option_b":       option_b,
+        "total_stock_gap":        total_stock_gap,
+        "procurement_viable": bool(a_assign),
+        "caveats":        all_caveats,
+    })
+
+    # -- Verbose summary --
+    if verbose:
+        print_procurement_result(result)
 
     return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TESTS
+# TEST RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -701,165 +892,25 @@ if __name__ == "__main__":
     from analyst import analyse
     from prediction_engine import SESSION
 
-    # ── Test case selection ────────────────────────────────────────────────────
-    # D017 Asthalin (A012 Supply Chain Failure, Jan — winter peak):
-    #   Total loss, Life-Critical, 10 hospitals all actionable.
-    #   Multiple distributors with real tradeoffs:
-    #     S009: fastest (5d) but only 50 units stock — below min-order
-    #     S001: large stock (943) but below min-order (1000)
-    #     S010: meets min-order (1298 stock, 1000 min) but slow (11d)
-    #   Shared API risk on its only alternative (Ventorlin).
-    #   Hard case — genuine dicey situation likely.
-    #
-    # D004 Amoxil (Cipla Disaster, Aug — monsoon peak):
-    #   Partial loss (Lupin 28% remains). H008 (5.9d), H004 (7d),
-    #   H001 (9.6d) need bridge orders. Multiple feasible distributors.
-    #   Tests two-call path with real choices.
-    #
-    # Comparison test: D017 Asthalin forced through two-call path
-    # to compare reasoning quality vs single-call.
-
-    # ── TEST 1: Single-call — Asthalin D017 (hard case) ──────────────────────
-    '''print("\n" + "="*62)
-    print("TEST 1: Single-call — D017 Asthalin")
-    print("  A012 Supply Chain Failure / High / January (winter peak)")
-    print("  Life-Critical | 10 hospitals | shared API risk on alternative")
-    print("="*62)
-
-    event1  = process_disruption(
-        "API", "A012", "Supply Chain Failure", "High", "2024-01-15")
-    pkgs1   = analyse(event1, verbose=False)
-    d017_p1 = next((p for p in pkgs1 if p.drug_id == "D017"), None)
-
-    if d017_p1:
-        r1 = run_procurement_agent(d017_p1)
-        print(f"\n  viable={r1.get('procurement_viable')} "
-              f"dicey={r1.get('is_dicey_case')} "
-              f"calls={r1.get('call_count')}")
-        for o in r1.get("option_a", []):
-            print(f"  Order: {o.get('distributor_name')} "
-                  f"qty={o.get('total_quantity')}")
-            for alloc in o.get("hospital_allocations", []):
-                print(f"    {alloc.get('hospital_id')}: "
-                      f"need={alloc.get('units_required')} "
-                      f"get={alloc.get('units_allocated')} "
-                      f"({alloc.get('coverage_note','')})")
-        if r1.get("is_dicey_case"):
-            print(f"  DICEY: {r1.get('dicey_tradeoff')}")
-            if r1.get("option_b"):
-                print(f"  Option B: {r1['option_b']}")
-        print(f"  Alternative: {r1.get('alternative_drug_assessment')}")
-        for c in r1.get("caveats", []):
-            print(f"  Caveat: {c}")
-    SESSION.reset()'''
-
-    # ── TEST 2: Two-call — Amoxil D004 (partial loss) ─────────────────────────
     print("\n" + "="*62)
-    print("TEST 2: Two-call — D004 Amoxil")
-    print("  Cipla Disaster / High / August | Partial loss (Lupin 28% remains)")
-    print("  H008 (5.9d), H004 (7d), H001 (9.6d) need bridge orders")
+    print("TEST: D004 Amoxil — Cipla Disaster / High / August")
+    print("  Partial loss (Lupin 28% remains)")
     print("="*62)
 
-    event2  = process_disruption(
-        "Factory", "F002", "Disaster", "High", "2024-08-15")
-    pkgs2   = analyse(event2, verbose=False)
-    d004_p2 = next((p for p in pkgs2 if p.drug_id == "D004"), None)
+    event = process_disruption("Factory", "F002", "Disaster", "High", "2024-08-15")
+    pkgs  = analyse(event, verbose=False)
+    d004  = next((p for p in pkgs if p.drug_id == "D004"), None)
 
-    if d004_p2:
-        r2 = run_procurement_agent(d004_p2)
-        print(f"\n  viable={r2.get('procurement_viable')} "
-              f"calls={r2.get('call_count')}")
-        print(f"  Summary: {r2.get('recommendation_summary','')[:120]}...")
-        bridge = r2.get("bridge_order", {}) or {}
-        if "total_bridge_cost_estimate" in bridge:
-            print(f"  Est. Cost: Rs {bridge.get('total_bridge_cost_estimate'):,}")
-
-        alloc = r2.get("allocation", {})
-        print(f"\n  [Call 1] Factory covers demand: {alloc.get('factory_covers_demand')}")
-        print(f"  Gap hospitals: {len(alloc.get('hospitals_needing_bridge',[]))}")
-        for h in alloc.get("hospitals_needing_bridge", []):
-            print(f"    {h.get('hospital_id')} — "
-                  f"gap={h.get('gap_days')}d  bridge={h.get('bridge_units_needed')} units")
-
-        print(f"\n  ── Option A ({len(r2.get('option_a',[]))} order(s)) ──")
-        for o in r2.get("option_a", []):
-            print(f"    [{o.get('distributor_id')}] {o.get('distributor_name')} "
-                  f"| qty={o.get('total_quantity')} | Rs {o.get('price_per_unit')}/unit")
-            for ah in o.get("hospital_allocations", []):
-                print(f"      {ah.get('hospital_id')}: "
-                      f"need={ah.get('units_required')} "
-                      f"get={ah.get('units_allocated')} ({ah.get('coverage_note','')})")
-            print(f"      Rationale: {o.get('rationale','')}")
-
-        if r2.get("is_dicey_case"):
-            print(f"\n  ⚠ DICEY: {r2.get('dicey_tradeoff')}")
-            opt_b = r2.get("option_b") or []
-            if opt_b:
-                print(f"  ── Option B ({len(opt_b)} order(s)) ──")
-                for o in opt_b:
-                    print(f"    [{o.get('distributor_id')}] {o.get('distributor_name')} "
-                          f"| qty={o.get('total_quantity')} | Rs {o.get('price_per_unit')}/unit")
-                    for ah in o.get("hospital_allocations", []):
-                        print(f"      {ah.get('hospital_id')}: "
-                              f"need={ah.get('units_required')} "
-                              f"get={ah.get('units_allocated')} ({ah.get('coverage_note','')})")
-                    print(f"      Rationale: {o.get('rationale','')}")
-
-        unserv = bridge.get("hospitals_unserviceable", [])
-        if unserv:
-            print(f"\n  ❌ UNSERVICEABLE HOSPITALS: {', '.join(unserv)}")
-
-        print()
-        for c in r2.get("caveats", []):
-            print(f"  ⚡ {c}")
+    if d004:
+        result = run_procurement_agent(d004, verbose=True)
+        # Dump full structured result to JSON for inspection
+        import pathlib
+        out_path = pathlib.Path("procurement_result.json")
+        with open(out_path, "w", encoding="utf-8") as fp:
+            json.dump(result, fp, indent=2, ensure_ascii=False, default=str)
+        print(f"  Full result saved → {out_path.resolve()}")
+    else:
+        print("  D004 not found in analysis results.")
 
     SESSION.reset()
 
-    # ── TEST 3: Comparison — D017 Asthalin through two-call path ──────────────
-    '''print("\n" + "="*62)
-    print("TEST 3: COMPARISON — D017 Asthalin forced through TWO-CALL path")
-    print("  Same drug/disruption as Test 1 — compare reasoning depth")
-    print("="*62)
-
-    event3  = process_disruption(
-        "API", "A012", "Supply Chain Failure", "High", "2024-01-15")
-    pkgs3   = analyse(event3, verbose=False)
-    d017_p3 = next((p for p in pkgs3 if p.drug_id == "D017"), None)
-
-    if d017_p3:
-        # Force partial-loss path by making remaining supply non-zero
-        orig_remaining = d017_p3.drug_units_remaining
-        orig_loss      = d017_p3.supply_loss_pct
-        d017_p3.drug_units_remaining = 1.0
-        d017_p3.supply_loss_pct      = 0.99
-        print("  [Forced to two-call path for comparison]")
-
-        r3 = run_procurement_agent(d017_p3)
-
-        # Restore
-        d017_p3.drug_units_remaining = orig_remaining
-        d017_p3.supply_loss_pct      = orig_loss
-
-        print(f"\n  viable={r3.get('procurement_viable')} "
-              f"calls={r3.get('call_count')}")
-        alloc3  = r3.get("allocation", {})
-        print(f"  Gap hospitals: "
-              f"{len(alloc3.get('hospitals_needing_bridge',[]))}")
-        for o in r3.get("option_a", []):
-            for alloc_h in o.get("hospital_allocations", []):
-                print(f"  Bridge → {alloc_h.get('hospital_id')}: "
-                      f"need={alloc_h.get('units_required')} "
-                      f"get={alloc_h.get('units_allocated')}")
-        if r3.get("is_dicey_case"):
-            print(f"  DICEY: {r3.get('dicey_tradeoff')}")
-
-        print("\n  ── COMPARISON ──")
-        print(f"  Test 1 (single): "
-              f"{len(r1.get('option_a',[]))} order(s) | "
-              f"dicey={r1.get('is_dicey_case')}")
-        print(f"  Test 3 (two):    "
-              f"{len(r3.get('option_a',[]))} order(s) | "
-              f"dicey={r3.get('is_dicey_case')}")
-        print("  Review full output above to compare reasoning depth.")'''
-
-    SESSION.reset()

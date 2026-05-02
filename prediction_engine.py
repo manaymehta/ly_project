@@ -50,7 +50,7 @@ NEO4J_USER     = "neo4j"
 NEO4J_PASSWORD = "QWEasd123"
 
 MODELS_DIR = "prophet_models"
-DATA_DIR   = "."
+DATA_DIR   = "./datasets"
 
 # Risk tier thresholds — NO_RISK is exactly 0; ranges are [low, high)
 RISK_LOW_MIN    = 0.001   # any positive score
@@ -73,7 +73,7 @@ def requires_action(risk_level):
 # Loaded once at startup. Recovery days = midpoint of (Min Days, Max Days).
 # Falls back to severity defaults if combination not found.
 
-def load_taxonomy(path="disruption_taxonomy.csv"):
+def load_taxonomy(path="datasets/disruption_taxonomy.csv"):
     taxonomy = {}
     try:
         df = pd.read_csv(path)
