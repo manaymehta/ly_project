@@ -1,0 +1,21 @@
+hospital_id,drug_id,drug_name,category,criticality,note,mae,rmse,mape,coverage_pct,n_cv_windows
+H001,D017,Asthalin,Respiratory,Life-Critical,High volume,4.43,5.33,16.31,30.6,1
+H009,D017,Asthalin,Respiratory,Life-Critical,Low volume,0.87,1.13,16.53,45.0,1
+H001,D018,Ventorlin,Respiratory,High,High volume,4.36,5.04,21.69,20.6,1
+H004,D018,Ventorlin,Respiratory,High,Infectious Disease,1.96,2.41,14.56,37.2,1
+H001,D004,Amoxil,Antibiotic,Moderate,High volume,28.53,34.51,26.74,23.9,1
+H004,D004,Amoxil,Antibiotic,Moderate,Infectious Disease,33.49,46.7,19.54,33.9,1
+H010,D004,Amoxil,Antibiotic,Moderate,Low volume,2.98,3.8,17.74,36.1,1
+H001,D006,Azithral,Antibiotic,Moderate,High volume,11.31,15.21,16.38,43.3,1
+H001,D001,Lantus,Diabetes,Life-Critical,High volume,2.05,3.08,16.5,42.8,1
+H003,D001,Lantus,Diabetes,Life-Critical,Mid volume,1.05,1.31,13.46,55.0,1
+H001,D002,Glycomet,Diabetes,High,High volume,21.56,30.25,21.44,30.6,1
+H010,D002,Glycomet,Diabetes,High,Low volume,1.26,1.57,8.02,60.0,1
+H002,D011,Amlip,Cardiovascular,Life-Critical,Cardiac,14.7,22.22,18.2,48.3,1
+H005,D011,Amlip,Cardiovascular,Life-Critical,Cardiac,4.18,5.13,7.85,58.9,1
+H001,D013,Atorva,Cardiovascular,Moderate,High volume,6.83,8.71,10.41,50.0,1
+H001,D008,Calpol,Painkiller,Moderate,High volume,22.89,27.76,8.67,55.0,1
+H008,D008,Calpol,Painkiller,Moderate,Mid volume,14.35,18.11,11.48,47.2,1
+H004,D007,Ciplox,Antibiotic,High,Infectious Disease,17.16,21.61,20.59,27.2,1
+H001,D015,Metolar,Cardiovascular,Life-Critical,High volume,4.66,5.76,8.5,50.0,1
+H010,D010,Brufen,Painkiller,Low,Low volume,0.87,1.07,8.35,57.8,1

@@ -78,13 +78,25 @@ def query(db_path: str, sql: str, params: tuple = ()):
 
 # ── Static files ──────────────────────────────────────────────────────────────
 
+FRONTEND_DIST = PROJECT_DIR / "frontend" / "dist"
+
+# Mount compiled React assets (js/css chunks) if the build exists
+if FRONTEND_DIST.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND_DIST / "assets")),
+        name="static-assets",
+    )
+
 @app.get("/", response_class=FileResponse)
 def index():
-    html = PROJECT_DIR / "dashboard.html"
-    if not html.exists():
-        raise HTTPException(status_code=404, detail="dashboard.html not found")
-    return FileResponse(str(html))
-
+    html = FRONTEND_DIST / "index.html"
+    if html.exists():
+        return FileResponse(str(html))
+    raise HTTPException(
+        status_code=404,
+        detail="Frontend not built. Run: cd frontend && npm run build",
+    )
 
 # ── /api/db-list ──────────────────────────────────────────────────────────────
 
@@ -96,10 +108,15 @@ def db_list():
 # ── /api/stats ────────────────────────────────────────────────────────────────
 
 @app.get("/api/stats")
-def stats(db: Optional[str] = Query(None)):
+def stats(db: Optional[str] = Query(None), since: Optional[str] = Query(None)):
     db_path = resolve_db(db)
-    rows = query(db_path,
-        "SELECT overall_risk_level, status, full_package FROM review_packages")
+    if since:
+        rows = query(db_path,
+            "SELECT overall_risk_level, status, full_package FROM review_packages "
+            "WHERE created_at >= ?", (since,))
+    else:
+        rows = query(db_path,
+            "SELECT overall_risk_level, status, full_package FROM review_packages")
 
     total     = len(rows)
     high      = sum(1 for r in rows if r["overall_risk_level"] == "HIGH_RISK")
@@ -118,9 +135,15 @@ def stats(db: Optional[str] = Query(None)):
                 zero_hosp += 1
 
     event = {}
-    meta = query(db_path,
-        "SELECT disruption_node, disruption_event, disruption_severity "
-        "FROM review_packages LIMIT 1")
+    if since:
+        meta = query(db_path,
+            "SELECT disruption_node, disruption_event, disruption_severity "
+            "FROM review_packages WHERE created_at >= ? ORDER BY created_at DESC LIMIT 1",
+            (since,))
+    else:
+        meta = query(db_path,
+            "SELECT disruption_node, disruption_event, disruption_severity "
+            "FROM review_packages ORDER BY created_at DESC LIMIT 1")
     if meta:
         event = meta[0]
 
@@ -135,15 +158,25 @@ RISK_ORDER = {"HIGH_RISK": 1, "MEDIUM_RISK": 2, "LOW_RISK": 3, "NO_RISK": 4}
 
 
 @app.get("/api/packages")
-def packages(db: Optional[str] = Query(None)):
+def packages(db: Optional[str] = Query(None), since: Optional[str] = Query(None)):
     db_path = resolve_db(db)
-    rows = query(db_path, """
-        SELECT package_id, disruption_node, disruption_event, disruption_severity,
-               drug_id, drug_name, criticality, overall_risk_level,
-               procurement_viable, clinical_suppressed, substitution_viable,
-               status, created_at, full_package
-        FROM review_packages
-    """)
+    if since:
+        rows = query(db_path, """
+            SELECT package_id, disruption_node, disruption_event, disruption_severity,
+                   drug_id, drug_name, criticality, overall_risk_level,
+                   procurement_viable, clinical_suppressed, substitution_viable,
+                   status, created_at, full_package
+            FROM review_packages
+            WHERE created_at >= ?
+        """, (since,))
+    else:
+        rows = query(db_path, """
+            SELECT package_id, disruption_node, disruption_event, disruption_severity,
+                   drug_id, drug_name, criticality, overall_risk_level,
+                   procurement_viable, clinical_suppressed, substitution_viable,
+                   status, created_at, full_package
+            FROM review_packages
+        """)
 
     result = []
     for r in rows:
@@ -171,6 +204,8 @@ def packages(db: Optional[str] = Query(None)):
                 "zero":    sum(1 for h in coverage if h.get("coverage_status") == "ZERO"),
             },
             "total_hospitals":     len(coverage),
+            "max_shortage_days":   max((h.get("coverage_gap") or 0 for h in coverage), default=0),
+            "affected_hospitals":  sum(1 for h in coverage if (h.get("coverage_gap") or 0) > 0),
             "disruption_node":     r["disruption_node"],
             "disruption_event":    r["disruption_event"],
             "disruption_severity": r["disruption_severity"],
@@ -197,12 +232,13 @@ def package_detail(package_id: str, db: Optional[str] = Query(None)):
     pkg = json.loads(r["full_package"])
     return {
         **{k: v for k, v in r.items() if k != "full_package"},
-        "drug":             pkg.get("drug", {}),
-        "hospital_coverage":pkg.get("hospital_coverage", []),
-        "procurement":      pkg.get("procurement", {}),
-        "clinical":         pkg.get("clinical", {}),
-        "action_summary":   pkg.get("action_summary", ""),
-        "action_required":  pkg.get("action_required", False),
+        "recovery_days":     (pkg.get("disruption") or {}).get("recovery_days"),
+        "drug":              pkg.get("drug", {}),
+        "hospital_coverage": pkg.get("hospital_coverage", []),
+        "procurement":       pkg.get("procurement", {}),
+        "clinical":          pkg.get("clinical", {}),
+        "action_summary":    pkg.get("action_summary", ""),
+        "action_required":   pkg.get("action_required", False),
     }
 
 
@@ -425,6 +461,33 @@ def graph_nodes():
             for r in s.run("MATCH (a:API)-[:COMPONENT_OF]->(d:Drug) RETURN a.id AS a, d.id AS d"):
                 edges.append({"from": r["a"], "to": r["d"], "label": "COMPONENT_OF"})
 
+            # ── Edges: Factory → Drug (synthesised via API) ────────────────────
+            # No direct Neo4j relationship — traverse Factory→API→Drug
+            seen_fd = set()
+            for r in s.run("""
+                MATCH (f:Factory)-[:PRODUCES_API]->(a:API)-[:COMPONENT_OF]->(d:Drug)
+                RETURN DISTINCT f.id AS f, d.id AS d
+            """):
+                key = (r["f"], r["d"])
+                if key not in seen_fd:
+                    seen_fd.add(key)
+                    edges.append({"from": r["f"], "to": r["d"], "label": "MANUFACTURES"})
+
+            # ── Edges: Drug → Distributor ──────────────────────────────────────
+            # DELIVERS_TO is Distributor→Hospital with a drugId property.
+            # Synthesise one Drug→Distributor edge per unique (drug, distributor) pair
+            # to complete the main supply chain: Factory→API→Drug→Distributor→Hospital
+            seen_dd = set()
+            for r in s.run("""
+                MATCH (dist:Distributor)-[rel:DELIVERS_TO]->(h:Hospital)
+                WHERE rel.drugId IS NOT NULL
+                RETURN DISTINCT rel.drugId AS drug_id, dist.id AS dist_id
+            """):
+                key = (r["drug_id"], r["dist_id"])
+                if key not in seen_dd:
+                    seen_dd.add(key)
+                    edges.append({"from": r["drug_id"], "to": r["dist_id"], "label": "SUPPLIED_BY"})
+
             # ── Edges: Distributor → Hospital ──────────────────────────────────
             # Deduplicate: one edge per (distributor, hospital) pair regardless of drug
             seen_dh = set()
@@ -449,6 +512,91 @@ def graph_nodes():
         raise HTTPException(status_code=500, detail=f"Neo4j error: {e}")
 
 
+# ── /api/graph/vulnerability ──────────────────────────────────────────────────
+
+@app.get("/api/graph/vulnerability")
+def graph_vulnerability():
+    """
+    Same topology as /api/graph/nodes but each node carries GNN scores:
+      vulnerability_score, centrality_score, dependency_score
+    Scores are written to Neo4j by gnn_centrality.py.
+    """
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+        nodes_map = {}
+        edges     = []
+
+        with driver.session() as s:
+            # ── Nodes with GNN scores ─────────────────────────────────────────
+            for label, disruptable in [
+                ("Factory",     True),
+                ("Drug",        False),
+                ("Distributor", True),
+                ("Hospital",    False),
+                ("API",         True),
+            ]:
+                for r in s.run(f"""
+                    MATCH (n:{label})
+                    RETURN n.id AS id, n.name AS name,
+                           coalesce(n.vulnerabilityScore, 0.0) AS vs,
+                           coalesce(n.centralityScore,    0.0) AS cs,
+                           coalesce(n.dependencyScore,    0.0) AS ds
+                """):
+                    nodes_map[r["id"]] = {
+                        "id":                r["id"],
+                        "label":             r["id"],
+                        "title":             f"{r['name']} | vuln={r['vs']:.3f} cent={r['cs']:.3f} dep={r['ds']:.3f}",
+                        "group":             label,
+                        "disruptable":       disruptable,
+                        "vulnerability_score": round(float(r["vs"]), 4),
+                        "centrality_score":    round(float(r["cs"]), 4),
+                        "dependency_score":    round(float(r["ds"]), 4),
+                    }
+
+            # ── Edges (same as supply chain graph) ────────────────────────────
+            for r in s.run("MATCH (f:Factory)-[:PRODUCES_API]->(a:API) RETURN f.id AS f, a.id AS a"):
+                edges.append({"from": r["f"], "to": r["a"], "label": "PRODUCES_API"})
+
+            for r in s.run("MATCH (a:API)-[:COMPONENT_OF]->(d:Drug) RETURN a.id AS a, d.id AS d"):
+                edges.append({"from": r["a"], "to": r["d"], "label": "COMPONENT_OF"})
+
+            seen_fd = set()
+            for r in s.run("""
+                MATCH (f:Factory)-[:PRODUCES_API]->(a:API)-[:COMPONENT_OF]->(d:Drug)
+                RETURN DISTINCT f.id AS f, d.id AS d
+            """):
+                key = (r["f"], r["d"])
+                if key not in seen_fd:
+                    seen_fd.add(key)
+                    edges.append({"from": r["f"], "to": r["d"], "label": "MANUFACTURES"})
+
+            seen_dd = set()
+            for r in s.run("""
+                MATCH (dist:Distributor)-[rel:DELIVERS_TO]->(h:Hospital)
+                WHERE rel.drugId IS NOT NULL
+                RETURN DISTINCT rel.drugId AS drug_id, dist.id AS dist_id
+            """):
+                key = (r["drug_id"], r["dist_id"])
+                if key not in seen_dd:
+                    seen_dd.add(key)
+                    edges.append({"from": r["drug_id"], "to": r["dist_id"], "label": "SUPPLIED_BY"})
+
+            seen_dh = set()
+            for r in s.run("MATCH (s:Distributor)-[:DELIVERS_TO]->(h:Hospital) RETURN DISTINCT s.id AS s, h.id AS h"):
+                key = (r["s"], r["h"])
+                if key not in seen_dh:
+                    seen_dh.add(key)
+                    edges.append({"from": r["s"], "to": r["h"], "label": "DELIVERS_TO"})
+
+        driver.close()
+        return {"nodes": list(nodes_map.values()), "edges": edges}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Neo4j error: {e}")
+
+
 # ── Session endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/api/session/start")
@@ -459,6 +607,8 @@ def session_start():
         return {"success": True, "session_id": sid}
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session start failed: {e}")
 
 
 @app.post("/api/session/end")
@@ -513,40 +663,39 @@ def run_disruption(body: DisruptionRequest):
             triggered_date = triggered_date,
         )
 
-        from prediction_engine import run_prediction_pipeline
-        results = run_prediction_pipeline(
-            body.node_type, body.node_id,
-            body.event_type, body.severity,
-            triggered_date,
-        )
-
-        packages = analyse(results, event)
+        packages = analyse(event)
 
         procurements, clinicals = {}, {}
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time
+        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 
-        actionable = [p for p in packages if p.invoke_procurement]
+        actionable = [p for p in packages if p.invoke_procurement or p.invoke_clinical]
 
         def _run_drug(pkg):
-            proc   = run_procurement_agent(pkg)
-            clin   = run_clinical_agent(pkg) if pkg.invoke_clinical else None
+            proc = run_procurement_agent(pkg) if pkg.invoke_procurement else None
+            clin = run_clinical_agent(pkg)    if pkg.invoke_clinical    else None
             return pkg.drug_id, proc, clin
 
-        with ThreadPoolExecutor(max_workers=len(actionable) or 1) as ex:
-            futures = {}
-            for i, pkg in enumerate(actionable):
-                if i > 0:
-                    time.sleep(10)
-                futures[ex.submit(_run_drug, pkg)] = pkg.drug_id
+        BATCH_SIZE = 2
+        batches = [actionable[i:i+BATCH_SIZE] for i in range(0, len(actionable), BATCH_SIZE)]
 
-            for fut in as_completed(futures):
-                try:
-                    drug_id, proc, clin = fut.result()
-                    procurements[drug_id] = proc
-                    clinicals[drug_id]    = clin
-                except Exception as e:
-                    print(f"[✗] Drug failed: {e}")
+        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as ex:
+            for b_idx, batch in enumerate(batches):
+                print(f"[Pipeline] Batch {b_idx+1}/{len(batches)}: {[p.drug_id for p in batch]}")
+                futures = {ex.submit(_run_drug, pkg): pkg.drug_id for pkg in batch}
+
+                # Block until every drug in this batch has finished both LLM calls
+                # before submitting the next batch — guarantees max 2 concurrent calls
+                done, _ = wait(futures, return_when=ALL_COMPLETED)
+
+                for fut in done:
+                    try:
+                        drug_id, proc, clin = fut.result()
+                        if proc is not None:
+                            procurements[drug_id] = proc
+                        if clin is not None:
+                            clinicals[drug_id] = clin
+                    except Exception as e:
+                        print(f"[✗] Drug failed: {e}")
 
         aggregate(
             packages     = packages,
@@ -558,15 +707,28 @@ def run_disruption(body: DisruptionRequest):
         )
 
         return {
-            "success":       True,
-            "triggered_date": triggered_date,
-            "total_packages": len(packages),
-            "actionable":    len(actionable),
+            "success":           True,
+            "triggered_date":    triggered_date,
+            "total_packages":    len(packages),
+            "actionable":        len(actionable),
+            "affected_drug_ids": [p.drug_id for p in actionable],
             "db":            os.path.basename(REVIEWS_DB),
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── SPA fallback ─────────────────────────────────────────────────────────────
+# Must be LAST — after all /api/* routes so it never shadows them.
+# Any unmatched path (e.g. /some/react/route) returns index.html.
+
+@app.get("/{full_path:path}", response_class=FileResponse)
+def spa_fallback(full_path: str):
+    html = FRONTEND_DIST / "index.html"
+    if html.exists():
+        return FileResponse(str(html))
+    raise HTTPException(status_code=404, detail="Frontend not built")
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────

@@ -316,9 +316,11 @@ def get_affected_pairs(node_type, node_id, recovery_days):
         """, {"id": node_id})
         dist_name = dist_data[0]["dist_name"] if dist_data else node_id
 
+        # Fetch the disrupted distributor's own stock per (drug, hospital)
         deliveries = neo4j_query("""
             MATCH (dist:Distributor {id: $id})-[r:DELIVERS_TO]->(h:Hospital)
-            RETURN r.drugId AS drug_id, h.id AS hospital_id
+            RETURN r.drugId AS drug_id, h.id AS hospital_id,
+                   r.currentStock AS dist_stock
         """, {"id": node_id})
 
         unique_drug_ids = list({row["drug_id"] for row in deliveries})
@@ -333,19 +335,39 @@ def get_affected_pairs(node_type, node_id, recovery_days):
             """, {"ids": unique_drug_ids})
             drug_meta = {r["drug_id"]: r for r in rows}
 
+        # Fetch total stock for each (drug, hospital) across ALL distributors
+        # so we can compute the disrupted distributor's actual share of supply
+        unique_hosp_ids = list({row["hospital_id"] for row in deliveries})
+        total_stock_rows = neo4j_query("""
+            MATCH (dist:Distributor)-[r:DELIVERS_TO]->(h:Hospital)
+            WHERE r.drugId IN $drug_ids AND h.id IN $hosp_ids
+            RETURN r.drugId AS drug_id, h.id AS hospital_id,
+                   SUM(r.currentStock) AS total_stock
+        """, {"drug_ids": unique_drug_ids, "hosp_ids": unique_hosp_ids})
+
+        # Build lookup: (drug_id, hospital_id) → total stock across all distributors
+        total_stock_map = {
+            (r["drug_id"], r["hospital_id"]): float(r["total_stock"] or 0)
+            for r in total_stock_rows
+        }
+
         for row in deliveries:
-            drug_id = row["drug_id"]
+            drug_id    = row["drug_id"]
+            hospital_id = row["hospital_id"]
             if drug_id not in drug_meta:
                 continue
-            dm = drug_meta[drug_id]
+            dm         = drug_meta[drug_id]
+            dist_stock = float(row["dist_stock"] or 0)
+            total_stock = total_stock_map.get((drug_id, hospital_id), dist_stock)
+
             affected.append({
                 "drug_id":         drug_id,
                 "drug_name":       dm["drug_name"],
-                "hospital_id":     row["hospital_id"],
+                "hospital_id":     hospital_id,
                 "api_id":          None,
                 "api_name":        None,
-                "api_units_lost":  1.0,
-                "total_api_supply":1.0,
+                "api_units_lost":  dist_stock,    # this distributor's stock lost
+                "total_api_supply":total_stock,   # total supply across all distributors
                 "yield_multiplier":1.0,
                 "recovery_days":   recovery_days,
                 "criticality":     dm["criticality"],
@@ -456,14 +478,13 @@ def calculate_shortage_probability(pair, drug_metrics):
     daily_demand  = inv["daily_demand"]
     recovery_days = pair["recovery_days"]
 
-    # Supply Loss
-    if pair["disruption_type"] == "Distributor":
-        supply_loss_pct = 1.0
-    else:
-        ym = pair["yield_multiplier"]
-        drug_units_lost  = pair["api_units_lost"]   * ym
-        drug_units_total = pair["total_api_supply"] * ym
-        supply_loss_pct = min(1.0, drug_units_lost / max(drug_units_total, 1.0))
+    # Supply Loss — for Distributor disruptions, api_units_lost = disrupted
+    # distributor's stock and total_api_supply = sum across all distributors,
+    # giving the true stock-share fraction rather than a hardcoded 1.0
+    ym = pair["yield_multiplier"]
+    drug_units_lost  = pair["api_units_lost"]   * ym
+    drug_units_total = pair["total_api_supply"] * ym
+    supply_loss_pct = min(1.0, drug_units_lost / max(drug_units_total, 1.0))
 
     # Demand Pressure (system-wide, shared across all hospitals affected by this drug)
     metrics = drug_metrics[drug_id]

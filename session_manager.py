@@ -135,12 +135,14 @@ def start_session() -> str:
 
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # Build fresh DB
-    if os.path.exists(SESSION_DB):
-        os.remove(SESSION_DB)
-
+    # Open (or create) the DB file and wipe previous session data in-place.
+    # We avoid os.remove() because Windows locks the file if any process
+    # (e.g. a previous uvicorn run) still has it open.
     conn = sqlite3.connect(SESSION_DB)
     conn.executescript(_DDL)
+    conn.execute("DELETE FROM session_info")
+    conn.execute("DELETE FROM distributor_stock")
+    conn.execute("DELETE FROM hospital_inventory")
 
     # ── 1. Session metadata ───────────────────────────────────────────────────
     conn.execute(

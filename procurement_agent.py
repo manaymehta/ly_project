@@ -37,6 +37,7 @@ Install:    pip install google-genai
 
 import re
 import json
+import threading
 from typing import Optional
 from google import genai
 from google.genai import types
@@ -44,7 +45,7 @@ from google.genai import types
 from analyst import DrugAlertPackage, HospitalRisk
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = "AIzaSyBsWNU1nC6Ntn0H4CaYtAaudchc39E1etA"
+GEMINI_API_KEY = "AIzaSyBcEeu5EgjkmYpDVy2ej1HUijEu8BdmlrE"
 GEMINI_MODEL   = "gemma-4-26b-a4b-it"   # ← change model name here if needed
 
 # Set False to force all drugs through the LLM (useful for testing parallel calls).
@@ -400,11 +401,9 @@ def _build_task(gap_hospitals: list) -> str:
         f'  "is_dicey_case": true or false,\n'
         f'  "dicey_tradeoff": "<description of the tradeoff, or \"N/A - Sufficient supply\" if is_dicey_case is false>",\n'
         f'  "option_a_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
-        f'  "option_a_strategy": "<1 sentence naming the strategy used (e.g. \"Abundant Supply Fulfillment\" or \"Universal Coverage\")>",\n'
-        f'  "option_b_scratchpad": {{"<HOSPITAL ID>": "<RESET ALL STOCK POOLS TO ORIGINAL VALUES. Apply Ruthless Triage: Feed top hospitals 100% until stock is 0. Explain math here>"}},\n'
+        f'  "option_a_strategy": "<If shortage, output \'Universal Coverage: Reduced top allocations\'. If no shortage, output \'Abundant Supply: Fulfilled 100%\'>",\n'        f'  "option_b_scratchpad": {{"<HOSPITAL ID>": "<Explain Exact Change, Min Order check, and updated global stock here. Reduce targets ONLY if there is a shortage.>"}},\n'
         f'  "option_b_assignments": {{"<HOSPITAL ID>":["<DISTRIBUTOR ID>", ...]}},\n'
-        f'  "option_b_strategy": "Ruthless Triage: Guaranteed 100% coverage for highest urgency, sacrificing lowest urgency.",\n'
-        f'  "hospitals_unserviceable": [],\n'
+        f'  "option_b_strategy": "<If shortage, output \'Ruthless Triage: Guaranteed 100% for top urgency\'. If no shortage, output \'Abundant Supply: Fulfilled 100%\'>",\n'        f'  "hospitals_unserviceable": [],\n'
         f'  "caveats": ["<caveat>"]\n'
         f"}}\n"
     )
@@ -433,12 +432,19 @@ def _build_bridge_prompt(pkg: DrugAlertPackage, gap_hospitals: list) -> str:
 # LLM CALL + PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
+_thread_local = threading.local()
+
+def _get_client() -> genai.Client:
+    if not hasattr(_thread_local, 'client'):
+        _thread_local.client = genai.Client(api_key=GEMINI_API_KEY)
+    return _thread_local.client
+
+
 def _call_gemini(prompt: str, max_tokens: int = 2048) -> str:
-    import sys, pathlib, threading
+    import sys, pathlib
     from datetime import datetime
 
-    # Fresh client per call — thread isolation (no shared httpx session across threads)
-    _client = genai.Client(api_key=GEMINI_API_KEY)
+    _client = _get_client()   # one client per worker thread, reused across batches
 
     thread_name = threading.current_thread().name
     try:

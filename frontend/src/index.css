@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: #0f1117;
+  color: #e2e8f0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #1a1d27;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2d3a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3d4a;
+}
+
+/* ── React Flow overrides ───────────────────────────────────── */
+.react-flow__node {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+}
+
+.react-flow__controls-button {
+  background: #1a1d27;
+  border-color: #2a2d3a;
+  color: #94a3b8;
+}
+.react-flow__controls-button:hover {
+  background: #222536;
+}
+.react-flow__controls-button svg {
+  fill: #94a3b8;
+}
+
+.react-flow__minimap-mask {
+  fill: rgba(15,17,23,0.75);
+}
+
+/* ── Cascade disruption animation ──────────────────────────────── */
+@keyframes cascadePing {
+  0%   { opacity: 0.85; transform: scale(1);   }
+  100% { opacity: 0;    transform: scale(1.75); }
+}

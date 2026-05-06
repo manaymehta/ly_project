@@ -5,6 +5,45 @@
 
 ---
 
+## What Has Been Built
+
+A complete end-to-end pharmaceutical supply chain disruption simulation and decision-support system. Everything listed below is implemented and working.
+
+### Backend Pipeline (Python)
+
+| Component | File | What it does |
+|-----------|------|-------------|
+| Event validation & taxonomy | `sentinel.py` | Validates disruption events, resolves nodes in Neo4j, looks up recovery duration from taxonomy CSV |
+| Demand forecasting & risk scoring | `prediction_engine.py` | Neo4j graph traversal to find affected hospital-drug pairs; Prophet ML demand forecasting; shortage probability scoring; HIGH/MEDIUM/LOW/NO_RISK classification |
+| DrugAlertPackage assembly | `analyst.py` | Groups prediction results by drug; fetches distributor options, hospital metadata, clinical alternatives from Neo4j; builds structured packages for LLM agents |
+| LLM procurement recommendations | `procurement_agent.py` | Calls Gemini LLM to generate bridge order allocations (Option A: universal coverage, Option B: ruthless triage); handles total-loss and partial-loss paths; micro-gap fast-path skips LLM for trivial cases |
+| Clinical substitution logic | `clinical_agent.py` | Deterministic Python (no LLM) — evaluates drug substitution viability, similarity tier, physician sign-off requirement for HIGH_RISK drugs |
+| Parallel orchestration & SQLite write | `aggregator.py` | Runs procurement + clinical agents in parallel via ThreadPoolExecutor; computes FULL/PARTIAL/ZERO hospital coverage; builds full_package JSON; writes to `reviews.db` |
+| Simulation session & depletion DB | `session_manager.py` | Seeds `session.db` from Neo4j + in-memory inventory; tracks live stock changes; deducts stock on order approval; resets on session end |
+| FastAPI backend | `dashboard_api.py` | All REST endpoints serving the dashboard; session lifecycle management; graph data; package review and approval |
+| GNN vulnerability scoring | `gnn_centrality.py` | One-time setup script; runs betweenness centrality via Neo4j GDS; computes dependency scores; writes `vulnerabilityScore` + `centralityScore` to all Drug, Factory, Distributor, API nodes in Neo4j |
+
+### React Dashboard Frontend (`/frontend`)
+
+**Tech stack:** Vite + React 18, Tailwind CSS, TanStack Query, React Flow (@xyflow/react)
+
+| Feature | What it does |
+|---------|-------------|
+| Session lifecycle | Start Session seeds live stock from Neo4j; End Session resets to baseline; all panels disabled until session is active |
+| Session-scoped stats bar | Live counts for total packages, high risk, pending review, dicey cases — filtered to the current session window |
+| Supply chain graph | Interactive React Flow graph showing Factory → API → Drug → Distributor → Hospital topology with colour-coded node groups and a minimap |
+| Node disruption trigger | Click any disruptable node (Factory / Distributor / API) on the graph; select event type and severity; fires the full pipeline; shows spinner during the 3–10 min LLM run |
+| GNN vulnerability graph | Toggle on the same graph area to show nodes coloured by computed vulnerability score (green → red gradient); CRIT/HIGH/MED/LOW/MIN tier labels per node |
+| Cascade disruption animation | When pipeline completes, the graph animates a wave propagating from the disrupted node outward through affected APIs → drugs → distributors → hospitals; each layer lights up with a ping ring and highlighted edges |
+| Review Queue | Paginated drug risk cards showing drug name, risk tier, coverage pills (Full/Partial/Zero hospitals), days until stockout, and disruption duration |
+| PackageDetailDrawer | Full slide-in drawer per drug: hospital coverage table (stock lasts / exposed gap / arrives-in columns), Option A and Option B procurement allocations with per-hospital unit breakdowns, clinical substitution guidance, approve/reject actions |
+| Toast notifications | Approve/reject actions fire a non-blocking success or error toast |
+| Heatmap view | Hospital × Drug coverage matrix showing FULL/PARTIAL/ZERO/NONE per cell across all drugs in the current disruption |
+| Depletion view | Shows baseline vs current stock per distributor after approvals are applied |
+| Hospital coverage table | Three focused columns: **Stock Lasts** (days until stockout), **Exposed** (days without supply after stockout before factory recovers = recovery_days − days_until_stockout), **Arrives In** (distributor delivery days); colour-coded red when exposed window > 0 or delivery arrives after stockout |
+
+---
+
 ## Project Intent
 
 LY Project is a **pharmaceutical supply chain disruption simulation and
@@ -14,11 +53,11 @@ occurs (factory disaster, distributor failure, raw material shortage), the
 system:
 
 1. Detects which hospitals and drugs are at risk
-2. Scores the risk using demand forecasts and supply loss calculations
-3. Generates LLM-powered procurement bridge order recommendations
-4. Generates LLM-powered clinical substitution recommendations
+2. Scores the risk using demand forecasts (Facebook Prophet ML) and supply loss calculations
+3. Generates LLM-powered (Gemini) procurement bridge order recommendations
+4. Generates deterministic clinical substitution recommendations
 5. Presents structured options for a human reviewer to approve or reject
-6. Tracks the decision and (eventually) depletes stock in the simulation
+6. Depletes live stock in the simulation session on approval
 
 The system is **not autonomous** — it never auto-executes orders.
 Every recommendation goes through human review and approval.
@@ -35,28 +74,19 @@ Every recommendation goes through human review and approval.
 | Parallel orchestration & SQLite write | `aggregator.py` | ✅ Complete |
 | Simulation session & depletion DB | `session_manager.py` | ✅ Complete |
 | FastAPI backend (all endpoints) | `dashboard_api.py` | ✅ Complete |
-| Analyst hook → session stock override | `analyst.py` | ✅ Complete |
-| **Dashboard HTML/JS frontend** | `dashboard.html` | ❌ Not built yet |
-| Interactive node graph (vis.js / D3) | inside `dashboard.html` | ❌ Not built yet |
-| Disruption trigger panel (UI) | inside `dashboard.html` | ❌ Not built yet |
-| Review cards + approval UI | inside `dashboard.html` | ❌ Not built yet |
-| Depletion view panel | inside `dashboard.html` | ❌ Not built yet |
-
-> [!IMPORTANT]
-> `dashboard.html` is the **only missing piece**. The entire Python backend, pipeline,
-> session management, and FastAPI API layer are fully implemented.
-> A new developer/LLM should focus exclusively on building `dashboard.html`.
+| GNN vulnerability scoring | `gnn_centrality.py` | ✅ Complete |
+| React dashboard — session & graph | `frontend/` | ✅ Complete |
+| React dashboard — disruption trigger | `frontend/` | ✅ Complete |
+| React dashboard — cascade animation | `frontend/` | ✅ Complete |
+| React dashboard — GNN vulnerability graph | `frontend/` | ✅ Complete |
+| React dashboard — review queue & drawer | `frontend/` | ✅ Complete |
+| React dashboard — heatmap & depletion | `frontend/` | ✅ Complete |
 
 > [!WARNING]
 > `POST /api/session/run-disruption` is **synchronous and blocks for 3–10 minutes**
-> (LLM calls + 10s stagger between drugs). The frontend MUST show a loading/spinner
-> state and must NOT time out the HTTP request. Consider using a polling pattern
-> (fire request → poll `/api/session/state` every 5s) or WebSockets if latency
-> becomes unacceptable.
-
-- Watch stock levels deplete in real-time after each approval
-- Run the next disruption against the updated (depleted) stock state
-- End the session and reset to baseline
+> (LLM calls + 10s stagger between drugs). The frontend holds the request open and
+> shows a spinner. Do not reduce the 10s stagger — it exists to stay under Gemini's
+> 15 RPM free-tier limit.
 
 ---
 
@@ -130,28 +160,69 @@ the seasonal pattern.
 
 ## Architecture — 7 Pipeline Stages
 
-```mermaid
-flowchart TD
-    UI(["Browser / Dashboard\nnode_type, node_id, event_type, severity, month+day"])
-    S["1. SENTINEL\nsentinel.py\n───────────────\n• Validate inputs\n• Resolve node in Neo4j\n• Look up recovery_days from taxonomy\n• Compute supply_loss_pct\n• Return DisruptionEvent"]
-    PE["2. PREDICTION ENGINE\nprediction_engine.py\n───────────────\n• Neo4j graph traversal → affected hospital+drug pairs\n• Prophet demand forecasting per pair\n• shortage_probability = supply_loss_pct × demand_pressure × time_factor\n• Risk classification: HIGH / MEDIUM / LOW / NO_RISK\n• Owns SimulationSession in memory"]
-    AN["3. ANALYST\nanalyst.py\n───────────────\n• Group pairs by drug_id\n• Build DrugAlertPackage per drug\n• Batch-fetch Neo4j context: hospital meta, distributor options\n• Override distributor stock from session.db if session active\n• Return List[DrugAlertPackage]"]
-    PA["4. PROCUREMENT AGENT\nprocurement_agent.py\n───────────────\n• TOTAL LOSS → 1 LLM call\n• PARTIAL LOSS → 2 LLM calls\n• Micro-gap → 0 LLM calls (Python fast-path)\n• Returns Option A + Option B allocations"]
-    CA["5. CLINICAL AGENT\nclinical_agent.py\n───────────────\n• HIGH_RISK drugs only\n• Evaluates drug substitutions\n• No LLM — deterministic Python\n• Flags physician sign-off if needed"]
-    AGG["6. AGGREGATOR\naggregator.py\n───────────────\n• Parallel: ThreadPoolExecutor per drug\n• Merge procurement + clinical results\n• Compute hospital coverage FULL/PARTIAL/ZERO\n• Build full_package JSON blob\n• Write to reviews.db"]
-    DB[("7. reviews.db\nreview_packages table\n───────────────\npending_review → approved / rejected")]
-    SM[("session.db\n───────────────\ndistributor_stock\nhospital_inventory")]
-
-    UI --> S
-    S --> PE
-    PE --> AN
-    AN --> PA
-    AN --> CA
-    PA --> AGG
-    CA --> AGG
-    AGG --> DB
-    AN -. "override stock\nif session active" .-> SM
-    AGG -. "apply_depletion\non approval" .-> SM
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Browser / React Dashboard                                      │
+│  node_type, node_id, event_type, severity, month+day           │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  1. SENTINEL  (sentinel.py)                                     │
+│  • Validate inputs and resolve node in Neo4j                    │
+│  • Look up recovery_days from disruption taxonomy CSV           │
+│  • Compute supply_loss_pct                                      │
+│  • Return DisruptionEvent dataclass                             │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. PREDICTION ENGINE  (prediction_engine.py)                   │
+│  • Neo4j graph traversal → all affected (hospital, drug) pairs  │
+│  • Prophet ML demand forecast per pair                          │
+│  • shortage_probability = supply_loss × demand × time_factor    │
+│  • Risk classification: HIGH / MEDIUM / LOW / NO_RISK           │
+│  • Owns SimulationSession (in-memory live inventory)            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. ANALYST  (analyst.py)                                       │
+│  • Group pairs by drug_id                                       │
+│  • Build DrugAlertPackage per drug                              │
+│  • Batch-fetch Neo4j context: hospital meta, distributor opts   │
+│  • Override distributor stock from session.db if active  ──────────► session.db
+│  • Return List[DrugAlertPackage]                                │
+└───────────────┬───────────────────────────────┬─────────────────┘
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐   ┌───────────────────────────────────┐
+│  4. PROCUREMENT AGENT    │   │  5. CLINICAL AGENT                │
+│  (procurement_agent.py)  │   │  (clinical_agent.py)              │
+│  • TOTAL LOSS → 1 LLM    │   │  • HIGH_RISK drugs only           │
+│  • PARTIAL LOSS → 2 LLM  │   │  • Deterministic Python (no LLM)  │
+│  • Micro-gap → fast-path │   │  • Drug substitution viability    │
+│  • Option A + Option B   │   │  • Physician sign-off flag        │
+└──────────────┬───────────┘   └──────────────────┬────────────────┘
+               │                                  │
+               └──────────────┬───────────────────┘
+                              │  (parallel via ThreadPoolExecutor)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  6. AGGREGATOR  (aggregator.py)                                 │
+│  • Merge procurement + clinical results per drug                │
+│  • Compute hospital coverage: FULL / PARTIAL / ZERO             │
+│  • Build full_package JSON blob                                 │
+│  • Write to reviews.db                          ───────────────────► session.db
+│                                                 (apply_depletion │   on approval)
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  7. reviews.db  — review_packages table                         │
+│  status: pending_review → approved / rejected                   │
+│  Human reviewer approves/rejects via dashboard                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -227,7 +298,7 @@ parses the response, and returns a procurement result with Option A
 | Component | Type | Purpose |
 |-----------|------|---------|
 | `run_procurement_agent()` | **public entry point** | Decides TOTAL LOSS vs PARTIAL LOSS path, calls LLM, returns procurement result dict |
-| `_call_gemini()` | private | Makes one LLM API call. Creates a fresh `genai.Client` per call for thread isolation |
+| `_call_gemini()` | private | Makes one LLM API call. Reuses a per-thread `genai.Client` via `threading.local()` — one client created per worker thread, reused across all batches |
 | `_build_bridge_prompt()` | private | Assembles full LLM prompt for the bridge order (partial loss path) |
 | `_build_task()` | private | The task/instruction section of the bridge prompt |
 | `_disruption_block()` | private | Disruption context block for the prompt |
@@ -279,7 +350,7 @@ to SQLite, and returns pending packages for human review.
 ---
 
 ### `session_manager.py` — Simulation Session & Depletion DB
-Persists live simulation state to `session.db` so the Flask dashboard
+Persists live simulation state to `session.db` so the FastAPI backend
 can read/write stock levels across HTTP requests. The single source of
 truth for distributor stock and hospital inventory during a session.
 
@@ -320,7 +391,7 @@ process that bridges the browser to all Python pipeline code.
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `index()` | route GET `/` | Serves `dashboard.html` |
+| `index()` | route GET `/` | Serves the React frontend (proxied via Vite in dev, static build in prod) |
 | `db_list()` | route GET `/api/db-list` | Lists all `.db` files in project dir (newest first) |
 | `stats()` | route GET `/api/stats` | Aggregate counts: total, high_risk, pending, dicey, zero_hospitals, event metadata |
 | `packages()` | route GET `/api/packages` | All package summaries from a DB, sorted HIGH→LOW |
@@ -387,7 +458,7 @@ to restore baseline state between runs.
 ### Parallelism
 - All actionable drugs run simultaneously via `ThreadPoolExecutor`
 - 10-second stagger between LLM submissions to stay under 15 RPM
-- Each thread gets a fresh `genai.Client` instance (no shared connection pool)
+- Each thread reuses one `genai.Client` via `threading.local()` — created once per worker thread, shared across all batches that thread handles (eliminates cold-start HTTP overhead between batches)
 - Per-drug `try/except` — one failure prints `[✗]` and pipeline continues
 
 ---
@@ -413,6 +484,9 @@ status, created_at, resolved_at, procurement_action, clinical_action, full_packa
                           shortage_probability, days_until_stockout,
                           units_required, units_acquired, coverage_gap,
                           coverage_pct, coverage_status } ]
+  NOTE: units_required = LLM bridge_required (units to cover exposed window) when
+  available; falls back to prophet_forecast_30d. Not the same as the raw 30-day
+  forecast — it is the gap-specific need computed as daily_demand × exposed_days.
   procurement:       { scenario, viable, is_dicey_case, dicey_tradeoff,
                         recommendation_summary, total_stock_gap, caveats,
                         option_a: [ { distributor_id, distributor_name,
@@ -433,39 +507,40 @@ status, created_at, resolved_at, procurement_action, clinical_action, full_packa
 
 ## Dashboard
 
-**Tech stack:** FastAPI (`dashboard_api.py`) + single-page HTML/JS frontend  
+**Tech stack:** FastAPI (`dashboard_api.py`) + React 18 frontend (Vite, Tailwind CSS, TanStack Query, React Flow)  
+**Frontend location:** `./frontend/` — run with `npm run dev` (Vite dev server proxies to FastAPI on port 8000)  
 **Backend:** Reads `reviews.db` (pipeline output) + `session.db` (simulation state)  
-**Run:** `uvicorn dashboard_api:app --reload --port 8000`  
+**Run backend:** `uvicorn dashboard_api:app --reload --port 8000`  
 **Auto-docs:** `http://localhost:8000/docs` (FastAPI Swagger UI)
 
 ### Dashboard Flow:
-1. **Start Session** → calls `session_manager.start_session()`
-2. **Node Graph** → supply chain network visualised as: `Factory → Drug → Distributor → Hospital`
-   - API nodes are shown connected to their Factory and Drug but are not part of the main chain
-   - Clickable nodes: Factory, Distributor, API (these can be disrupted)
-   - Display-only nodes: Drug, Hospital (no disruption action)
-3. **Disruption Panel** → selects: event_type, severity, month+day (year auto-set to current)
-   - Fires full pipeline: Sentinel → Analyst → Agents → Aggregator
-4. **Review Panel** → shows drug risk cards, hospital coverage, Option A vs Option B
-   - User approves → `apply_depletion()` called → stock depleted in session.db
-5. **Depletion View** → shows updated stock levels (baseline vs current) per distributor
-6. **End Session** → `session_manager.end_session()` → all stock resets to baseline
+1. **Start Session** → calls `session_manager.start_session()`; all panels unlock
+2. **Supply Chain Graph** → React Flow graph showing `Factory → API → Drug → Distributor → Hospital` in column layout. Colour-coded by node group. Click any disruptable node (Factory / API / Distributor) to open the disruption panel.
+3. **GNN Vulnerability Graph** → toggle on the same graph area. Nodes coloured green→red by `vulnerabilityScore`. Shows structural risk independent of any active disruption.
+4. **Disruption Panel** → select event_type and severity; fires full pipeline with a spinner. Disrupt button disabled while pipeline runs to prevent concurrent state corruption.
+5. **Cascade Animation** → when pipeline completes, the graph animates the disruption wave outward layer by layer (disrupted node → APIs → drugs → distributors → hospitals) using the `affected_drug_ids` from the pipeline response.
+6. **Review Queue** → drug risk cards appear; each shows risk tier, coverage pills, days until stockout, disruption duration.
+7. **Package Detail Drawer** → full drug detail: hospital coverage table (Stock Lasts / Exposed gap / Arrives In), Option A + B procurement allocations, clinical substitution guidance, approve/reject.
+8. **Heatmap** → Hospital × Drug coverage matrix across all drugs in the disruption.
+9. **Depletion View** → distributor stock baseline vs current after approvals.
+10. **End Session** → `session_manager.end_session()` → stock resets to baseline; `reviews.db` untouched.
 
 ### FastAPI Endpoints:
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/db-list` | GET | List available review DBs |
-| `/api/packages` | GET | All packages summary from a DB |
-| `/api/packages/<id>` | GET | Full package detail |
-| `/api/stats` | GET | Aggregate counts for event banner |
+| `/api/packages` | GET | All packages summary from a DB (supports `?since=` for session-scoped filtering) |
+| `/api/packages/{id}` | GET | Full package detail — includes parsed `recovery_days` from disruption block |
+| `/api/packages/{id}/action` | POST | Approve Option A/B or Reject — updates SQLite, calls apply_depletion on approval |
+| `/api/stats` | GET | Aggregate counts for session bar (supports `?since=` for session-scoped stats) |
 | `/api/heatmap` | GET | Hospital × Drug coverage matrix |
 | `/api/distributors` | GET | Distributor stress (assigned vs stock) |
-| `/api/packages/<id>/action` | POST | Approve Option A/B or Reject |
 | `/api/session/start` | POST | Start simulation session — seeds session.db from Neo4j + SESSION |
 | `/api/session/end` | POST | End session — marks inactive, resets SESSION |
 | `/api/session/state` | GET | Current depletion delta snapshot (baseline vs current per distributor) |
-| `/api/session/run-disruption` | POST | **Triggers full pipeline** — accepts node_type, node_id, event_type, severity, month, day. Writes to reviews.db |
-| `/api/graph/nodes` | GET | **Returns all nodes + edges for vis.js graph** — Factory, Drug, Distributor, Hospital, API nodes with their connections |
+| `/api/session/run-disruption` | POST | **Triggers full pipeline** — accepts node_type, node_id, event_type, severity, month, day. Returns `affected_drug_ids` used by cascade animation. |
+| `/api/graph/nodes` | GET | All nodes + edges for React Flow supply chain graph |
+| `/api/graph/vulnerability` | GET | Same topology + GNN scores per node for vulnerability graph toggle |
 
 ---
 
@@ -511,6 +586,7 @@ process_disruption(
 - **`reviews.db` is a permanent audit log — it is never reset or deleted.** It is initialized automatically when the FastAPI server starts (`aggregator.init_db()` called in lifespan). All disruption runs across all sessions accumulate here permanently. This is intentional — it is the historical record of every decision made in the system. Do not delete it between sessions.
 - **`session.db` and `reviews.db` do not exist until runtime.** `session.db` is created the moment `POST /api/session/start` is called. `reviews.db` is created by the aggregator the first time a disruption runs. Neither is shipped with the code — their absence from the project directory is normal.
 - **Node ID format:** When the user clicks a node in the graph and triggers a disruption, the frontend must send the correct `node_id` to `/api/session/run-disruption`. Format: Factories = `F001`–`F005`, Distributors = `S001`–`S010`, APIs = `A004`, `A012`, etc. These IDs come directly from Neo4j node `.id` properties and are included in the `/api/graph/nodes` response.
-- **Graph scale — use hierarchical layout, NOT force-directed.** Neo4j contains **1,877 total edges** (1,640 DELIVERS_TO + 200 USES + 17 PRODUCES_API + 20 COMPONENT_OF). Rendering all of these would be unusable. The `/api/graph/nodes` endpoint returns only **~137 structural edges** for visualization: 17 Factory→API + 20 API→Drug + 100 Distributor→Hospital (deduplicated from 1,640 — one edge per distributor–hospital pair regardless of drug). USES edges (Hospital→Drug, 200 edges) are intentionally hidden to keep rendering fast. Use vis.js Network with `layout: { hierarchical: { direction: 'LR', sortMethod: 'directed', levelSeparation: 200, nodeSpacing: 80 } }` and `physics: { enabled: false }`. This renders the chain as clean left-to-right levels.
+- **Graph rendering — column layout, not force-directed.** Neo4j has 1,877 total edges. Rendering all of them is unusable. `/api/graph/nodes` returns ~137 structural edges: 17 Factory→API, 20 API→Drug, 100 Distributor→Hospital (deduplicated), 0 NEEDS_DRUG (Hospital→Drug hidden — 200 edges would clutter). The React Flow frontend uses a custom `applyColumnLayout` that positions nodes in left-to-right columns by group (Factory | API | Drug | Distributor | Hospital) with no physics. `NEEDS_DRUG` is the correct Neo4j relationship name — `USES` does not exist; any Cypher query using `[:USES]` returns zero results silently.
+- **STOCKS vs SUPPLIED_BY edge label:** The cascade animation in `SupplyChainGraph.jsx` references edge label `SUPPLIED_BY` for the Drug→Distributor hop. The Neo4j relationship is actually named `STOCKS`. Verify the label returned by `/api/graph/nodes` matches what the cascade traversal expects — a mismatch here silently breaks the distributor layer of the cascade for distributor disruptions.
 - **LLM rate limit — do not reduce the 10s stagger.** The pipeline staggers LLM calls by 10 seconds between drugs specifically to stay under the Gemini free tier limit of 15 requests per minute. Reducing this will cause 429 errors that trigger tenacity retries, making the pipeline appear hung.
 - **`test_runner.py` writes to named DBs, not `reviews.db`.** Running test cases will NOT pollute the dashboard's review queue. Each test case writes to its own `test_*.db` file.

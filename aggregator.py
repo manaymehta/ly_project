@@ -133,15 +133,21 @@ def _compute_hospital_coverage(
         units_required, units_acquired, coverage_gap
         coverage_status: FULL | PARTIAL | NONE | COVERED_BY_FACTORY
     """
-    # Build units_acquired lookup from option_a allocations
-    acquired = {}   # hospital_id → units_acquired
-    orders   = procurement.get("option_a") or []
+    # Build units_acquired and bridge_required lookups from option_a allocations.
+    # allocation.units_required = the bridge need the LLM was given (not the full
+    # 30-day forecast) — using it as the baseline ensures a fully-covered bridge
+    # order shows FULL coverage rather than PARTIAL.
+    acquired        = {}   # hospital_id → units_acquired
+    bridge_required = {}   # hospital_id → units the procurement was asked to cover
+    orders          = procurement.get("option_a") or []
 
     for order in orders:
         for alloc in order.get("hospital_allocations", []):
             hid = alloc.get("hospital_id", "")
             qty = alloc.get("units_allocated", 0) or 0
-            acquired[hid] = acquired.get(hid, 0) + qty
+            req = alloc.get("units_required",  0) or 0
+            acquired[hid]        = acquired.get(hid, 0) + qty
+            bridge_required[hid] = max(bridge_required.get(hid, 0), req)
 
     # For PARTIAL_LOSS: hospitals covered by factory don't need orders
     factory_covered = set()
@@ -156,8 +162,10 @@ def _compute_hospital_coverage(
         if not h.requires_action:
             continue
 
-        hid           = h.hospital_id
-        units_required = h.prophet_forecast_30d
+        hid = h.hospital_id
+        # Use the bridge need from the procurement allocation when available.
+        # Falls back to the full 30-day forecast for drugs with no procurement data.
+        units_required = bridge_required.get(hid) or h.prophet_forecast_30d
         units_acquired = acquired.get(hid, 0)
         coverage_gap   = max(0, units_required - units_acquired)
 
