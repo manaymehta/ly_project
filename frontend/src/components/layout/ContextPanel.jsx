@@ -9,12 +9,52 @@ const GROUP_COLORS = {
 }
 
 const EVENT_TYPES = {
-  Factory:     ['Disaster', 'Strike', 'Supply Chain Failure'],
-  Distributor: ['Logistics Failure', 'Supply Chain Failure'],
-  API:         ['Raw Material Shortage', 'Supply Chain Failure', 'Disaster'],
+  Factory:     ['Disaster', 'Equipment Failure', 'Strike', 'License Hold', 'Raw Material Shortage'],
+  Distributor: ['Logistics Failure', 'Strike', 'License Suspension', 'Storage Failure', 'Disaster'],
+  API:         ['Raw Material Shortage', 'Supply Chain Failure'],
 }
 
-const SEVERITIES = ['High', 'Medium', 'Low']
+// Valid severities per event type, derived from disruption_taxonomy.csv
+const SEVERITY_BY_EVENT = {
+  // Factory events
+  'Disaster':              ['High', 'Medium'],
+  'Equipment Failure':     ['High', 'Medium', 'Low'],
+  'Strike':                ['High', 'Medium'],
+  'License Hold':          ['High', 'Medium'],
+  'Raw Material Shortage': ['High', 'Medium'],
+  // Distributor events
+  'Logistics Failure':     ['High', 'Medium'],
+  // 'Strike' already defined above — same severities (High, Medium) differ: Distributor Strike is Medium-only
+  // Override handled below with node-type-aware lookup
+  'License Suspension':    ['High'],
+  'Storage Failure':       ['High', 'Medium'],
+  // 'Disaster' already defined — Distributor Disaster is High-only, Factory is High/Medium
+  // API events
+  'Supply Chain Failure':  ['High'],
+}
+
+// Node-type-aware severity lookup to handle cases where the same event name
+// has different valid severities across node types (Strike, Disaster).
+const SEVERITY_BY_NODE_EVENT = {
+  Factory: {
+    'Disaster':              ['High', 'Medium'],
+    'Equipment Failure':     ['High', 'Medium', 'Low'],
+    'Strike':                ['High', 'Medium'],
+    'License Hold':          ['High', 'Medium'],
+    'Raw Material Shortage': ['High', 'Medium'],
+  },
+  Distributor: {
+    'Logistics Failure':     ['High', 'Medium'],
+    'Strike':                ['Medium'],
+    'License Suspension':    ['High'],
+    'Storage Failure':       ['High', 'Medium'],
+    'Disaster':              ['High'],
+  },
+  API: {
+    'Raw Material Shortage': ['High'],
+    'Supply Chain Failure':  ['High'],
+  },
+}
 
 const MONTHS = [
   'January','February','March','April','May','June',
@@ -175,15 +215,27 @@ function ReviewReadyPrompt() {
 
 function DisruptionForm() {
   const { selectedNode, startPipeline, pipelineDone, pipelineFailed } = useApp()
-  const colors      = GROUP_COLORS[selectedNode?.group] || {}
+  const colors       = GROUP_COLORS[selectedNode?.group] || {}
   const eventOptions = EVENT_TYPES[selectedNode?.group] || []
 
-  const [eventType,  setEventType]  = useState(eventOptions[0] || '')
-  const [severity,   setSeverity]   = useState('High')
+  const initialEvent    = eventOptions[0] || ''
+  const initialSevOpts  = (SEVERITY_BY_NODE_EVENT[selectedNode?.group] || {})[initialEvent] || ['High']
+  const initialSeverity = initialSevOpts[0] || 'High'
+
+  const [eventType,  setEventType]  = useState(initialEvent)
+  const [severity,   setSeverity]   = useState(initialSeverity)
   const [month,      setMonth]      = useState(new Date().getMonth() + 1)
   const [day,        setDay]        = useState(new Date().getDate())
   const [submitting, setSubmitting] = useState(false)
   const [error,      setError]      = useState(null)
+
+  const severityOptions = (SEVERITY_BY_NODE_EVENT[selectedNode?.group] || {})[eventType] || ['High', 'Medium', 'Low']
+
+  function handleEventTypeChange(newEventType) {
+    setEventType(newEventType)
+    const validSevs = (SEVERITY_BY_NODE_EVENT[selectedNode?.group] || {})[newEventType] || ['High']
+    setSeverity(validSevs[0])
+  }
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -249,7 +301,7 @@ function DisruptionForm() {
           <label className="text-xs text-slate-400">Event Type</label>
           <select
             value={eventType}
-            onChange={e => setEventType(e.target.value)}
+            onChange={e => handleEventTypeChange(e.target.value)}
             className="w-full bg-surfaceHigh border border-border rounded px-3 py-2 text-sm
                        text-slate-200 focus:outline-none focus:border-slate-500"
           >
@@ -263,7 +315,7 @@ function DisruptionForm() {
         <div className="flex flex-col gap-1.5">
           <label className="text-xs text-slate-400">Severity</label>
           <div className="flex gap-2">
-            {SEVERITIES.map(s => (
+            {severityOptions.map(s => (
               <button
                 key={s}
                 type="button"

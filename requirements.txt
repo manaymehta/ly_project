@@ -1,0 +1,22 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Core pipeline
+neo4j==6.1.0
+pandas==2.3.3
+numpy==2.0.1
+prophet==1.3.0
+cmdstanpy==1.3.0
+scikit-learn==1.8.0
+scipy==1.16.3
+python-dotenv==1.2.1
+
+# LLM
+google-genai==1.73.1
+
+# API server
+fastapi==0.128.0
+uvicorn==0.40.0
+
+# GNN
+torch==2.5.1
+torch-geometric

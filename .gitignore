@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Databases (runtime generated — directory kept via .gitkeep)
+db/session.db
+db/reviews.db
+tests/*.db
+
+# Prophet models (regenerate with scripts/train_prophet_models.py)
+ml/models/prophet_models/
+
+# LLM response logs
+raw_output/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/

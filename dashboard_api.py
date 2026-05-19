@@ -11,8 +11,15 @@ import glob
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Add core/ to path so pipeline modules are importable
+sys.path.insert(0, str(Path(__file__).parent / "core"))
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -24,7 +31,7 @@ from pydantic import BaseModel
 # ── App ───────────────────────────────────────────────────────────────────────
 
 PROJECT_DIR = Path(__file__).parent
-REVIEWS_DB  = str(PROJECT_DIR / "reviews.db")   # permanent audit log
+REVIEWS_DB  = str(PROJECT_DIR / "db" / "reviews.db")   # permanent audit log
 
 from contextlib import asynccontextmanager
 
@@ -199,7 +206,7 @@ def packages(db: Optional[str] = Query(None), since: Optional[str] = Query(None)
             "action_summary":      pkg.get("action_summary", ""),
             "total_stock_gap":     proc.get("total_stock_gap", 0),
             "coverage": {
-                "full":    sum(1 for h in coverage if h.get("coverage_status") == "FULL"),
+                "full":    sum(1 for h in coverage if h.get("coverage_status") == "ALLOCATED"),
                 "partial": sum(1 for h in coverage if h.get("coverage_status") == "PARTIAL"),
                 "zero":    sum(1 for h in coverage if h.get("coverage_status") == "ZERO"),
             },
@@ -218,6 +225,43 @@ def packages(db: Optional[str] = Query(None), since: Optional[str] = Query(None)
     return result
 
 
+# ── /api/packages/{id}/outcome ───────────────────────────────────────────────
+# MUST be registered BEFORE /api/packages/{package_id:path} — the :path wildcard
+# would otherwise swallow the /outcome suffix and shadow this endpoint entirely.
+
+@app.get("/api/packages/{package_id:path}/outcome")
+def package_outcome(
+    package_id: str,
+    action: str = Query("approve_a"),
+    db: Optional[str] = Query(None),
+):
+    """
+    Runs the stock trajectory simulation for a package + decision.
+
+    action: "approve_a" | "approve_b" | "reject"
+      approve_a / approve_b — uses that option's delivery schedule as the approved trajectory
+      reject                — approved trajectory uses option_a as the counterfactual
+                              (shows what approving would have done vs what rejection means)
+
+    Returns approved + rejected trajectories per gap hospital plus summary stats.
+    """
+    db_path = resolve_db(db)
+    rows = query(db_path,
+        "SELECT full_package FROM review_packages WHERE package_id = ?", (package_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="Package not found")
+
+    pkg           = json.loads(rows[0]["full_package"])
+    procurement   = pkg.get("procurement", {})
+    coverage      = pkg.get("hospital_coverage", [])
+    recovery_days = int((pkg.get("disruption") or {}).get("recovery_days") or 30)
+
+    option_key = "option_b" if action == "approve_b" else "option_a"
+
+    from outcome_simulator import simulate
+    return simulate(coverage, procurement, recovery_days, option_key)
+
+
 # ── /api/packages/{id} ────────────────────────────────────────────────────────
 
 @app.get("/api/packages/{package_id:path}")
@@ -232,7 +276,8 @@ def package_detail(package_id: str, db: Optional[str] = Query(None)):
     pkg = json.loads(r["full_package"])
     return {
         **{k: v for k, v in r.items() if k != "full_package"},
-        "recovery_days":     (pkg.get("disruption") or {}).get("recovery_days"),
+        "recovery_days":      (pkg.get("disruption") or {}).get("recovery_days"),
+        "procurement_action": r.get("procurement_action"),   # JSON string or None
         "drug":              pkg.get("drug", {}),
         "hospital_coverage": pkg.get("hospital_coverage", []),
         "procurement":       pkg.get("procurement", {}),
@@ -356,12 +401,80 @@ def package_action(package_id: str, body: ActionRequest,
     return {"success": True, "status": status}
 
 
+# ── /api/packages/{id}/retry-procurement ─────────────────────────────────────
+
+@app.post("/api/packages/{package_id:path}/retry-procurement")
+def retry_procurement(package_id: str, db: Optional[str] = Query(None)):
+    """
+    Re-runs the procurement agent for a package that previously failed with an API error.
+    Rebuilds the DrugAlertPackage from stored disruption params, runs the LLM call,
+    and updates the existing DB record in place.
+    """
+    db_path = resolve_db(db)
+    rows = query(db_path,
+        "SELECT drug_id, disruption_node, disruption_event, disruption_severity, "
+        "full_package FROM review_packages WHERE package_id = ?", (package_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="Package not found")
+
+    r           = rows[0]
+    node_id     = r["disruption_node"]
+    event_type  = r["disruption_event"]
+    severity    = r["disruption_severity"]
+    full_pkg    = json.loads(r["full_package"])
+
+    # Infer node_type from stored full_package disruption block
+    disruption    = full_pkg.get("disruption") or {}
+    triggered_date = disruption.get("triggered_date") or datetime.now().strftime("%Y-%m-%d")
+
+    # node_type: derive from ID prefix (F→Factory, S→Distributor, A→API)
+    prefix_map = {"F": "Factory", "S": "Distributor", "A": "API"}
+    node_type  = prefix_map.get((node_id or "")[:1], "Factory")
+
+    try:
+        from sentinel           import process_disruption
+        from analyst            import analyse
+        from procurement_agent  import run_procurement_agent
+        from aggregator         import _build_package_row   # type: ignore
+
+        event    = process_disruption(node_type, node_id, event_type, severity, triggered_date)
+        packages = analyse(event, verbose=False)
+        pkg_obj  = next((p for p in packages if p.drug_id == r["drug_id"]), None)
+
+        if pkg_obj is None:
+            raise HTTPException(status_code=422,
+                detail=f"Drug {r['drug_id']} not found in re-analysis results.")
+
+        proc = run_procurement_agent(pkg_obj, verbose=True)
+
+        if proc.get("api_error"):
+            raise HTTPException(status_code=503,
+                detail="LLM API still returning errors — try again in a moment.")
+
+        # Re-aggregate just this one drug and overwrite its DB row
+        from aggregator import aggregate
+        aggregate(
+            packages     = [pkg_obj],
+            procurements = {r["drug_id"]: proc},
+            clinicals    = {},
+            event_type   = event_type,
+            severity     = severity,
+            db_path      = db_path,
+        )
+
+        return {"success": True, "drug_id": r["drug_id"]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retry failed: {e}")
+
 
 # ── /api/graph/nodes ──────────────────────────────────────────────────────────
 
-NEO4J_URI      = "neo4j://127.0.0.1:7687"
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "QWEasd123"
+NEO4J_URI      = os.environ["NEO4J_URI"]
+NEO4J_USER     = os.environ["NEO4J_USER"]
+NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
 
 # vis.js group → colour mapping (used by frontend for node colouring)
 NODE_COLOURS = {
@@ -633,6 +746,16 @@ class DisruptionRequest(BaseModel):
     day:        int           # 1–31
 
 
+# Valid (node_type, event_type) pairs — derived from data/disruption_taxonomy.csv.
+# Used as a server-side safety net to reject invalid combinations even if the
+# frontend is bypassed.
+VALID_EVENT_TYPES: dict[str, list[str]] = {
+    "Factory":     ["Disaster", "Equipment Failure", "Strike", "License Hold", "Raw Material Shortage"],
+    "Distributor": ["Logistics Failure", "Strike", "License Suspension", "Storage Failure", "Disaster"],
+    "API":         ["Raw Material Shortage", "Supply Chain Failure"],
+}
+
+
 @app.post("/api/session/run-disruption")
 def run_disruption(body: DisruptionRequest):
     """
@@ -644,6 +767,23 @@ def run_disruption(body: DisruptionRequest):
     if not session_manager.is_active():
         raise HTTPException(status_code=400,
                             detail="No active session. Call /api/session/start first.")
+
+    # ── Taxonomy validation (server-side safety net) ───────────────────────────
+    valid_events = VALID_EVENT_TYPES.get(body.node_type)
+    if valid_events is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid node_type '{body.node_type}'. "
+                   f"Must be one of: {sorted(VALID_EVENT_TYPES.keys())}",
+        )
+    if body.event_type not in valid_events:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Event type '{body.event_type}' is not valid for node type '{body.node_type}'. "
+                f"Valid event types: {', '.join(valid_events)}"
+            ),
+        )
 
     year = datetime.now().year
     triggered_date = f"{year}-{body.month:02d}-{body.day:02d}"
